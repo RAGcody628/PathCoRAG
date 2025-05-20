@@ -1,7 +1,7 @@
 
 ## API Server Implementation
 
-LightRAG also provides a FastAPI-based server implementation for RESTful API access to RAG operations. This allows you to run LightRAG as a service and interact with it through HTTP requests.
+PathCoRAG also provides a FastAPI-based server implementation for RESTful API access to RAG operations. This allows you to run PathCoRAG as a service and interact with it through HTTP requests.
 
 ### Setting up the API Server
 <details>
@@ -23,7 +23,7 @@ export EMBEDDING_MODEL="Your embedding model" # Optional: Defaults to "text-embe
 
 3. Run the API server:
 ```bash
-python examples/lightrag_api_openai_compatible_demo.py
+python examples/PathCoRAG_api_openai_compatible_demo.py
 ```
 
 The server will start on `http://0.0.0.0:8020`.

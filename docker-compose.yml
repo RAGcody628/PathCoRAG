@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  lightrag:
+  PathCoRAG:
     build: .
     ports:
       - "${PORT:-9621}:9621"
@@ -14,9 +14,9 @@ services:
       - TZ=UTC
     restart: unless-stopped
     networks:
-      - lightrag_net
+      - PathCoRAG_net
     extra_hosts:
       - "host.docker.internal:host-gateway"
 networks:
-  lightrag_net:
+  PathCoRAG_net:
     driver: bridge

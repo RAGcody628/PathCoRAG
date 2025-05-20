@@ -1,7 +1,10 @@
 import re
 import json
 import asyncio
-from lightrag import LightRAG, QueryParam
+from PathCoRAG import PathCoRAG, QueryParam
+from PathCoRAG.llm.openai import gpt_4o_mini_complete, openai_embed
+from PathCoRAG.llm.ollama import ollama_model_complete, ollama_embed
+from PathCoRAG.utils import EmbeddingFunc
 from tqdm import tqdm
 
 
@@ -62,14 +65,23 @@ def run_queries_and_save_to_json(
 
 
 if __name__ == "__main__":
-    cls = "agriculture"
-    mode = "hybrid"
+    cls = "mix"
+    mode = "final"
     WORKING_DIR = f"../{cls}"
 
-    rag = LightRAG(working_dir=WORKING_DIR)
-    query_param = QueryParam(mode=mode)
+    rag = PathCoRAG(
+    working_dir=WORKING_DIR,
+    embedding_func=openai_embed,
+    llm_model_func=gpt_4o_mini_complete,
+    # llm_model_func=gpt_4o_complete
+    )
+    
+    query_param = QueryParam(
+        mode=mode,
+        addon_params={"embedding_func": rag.embedding_func}
+    )
 
     queries = extract_queries(f"../datasets/questions/{cls}_questions.txt")
     run_queries_and_save_to_json(
-        queries, rag, query_param, f"{cls}_result.json", f"{cls}_errors.json"
+        queries, rag, query_param, f"{mode}_{cls}_result.json", f"{mode}_{cls}_errors.json"
     )

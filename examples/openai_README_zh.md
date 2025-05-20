@@ -1,8 +1,8 @@
 
 ## API 服务器实现
 
-LightRAG also provides a FastAPI-based server implementation for RESTful API access to RAG operations. This allows you to run LightRAG as a service and interact with it through HTTP requests.
-LightRAG 还提供基于 FastAPI 的服务器实现，用于对 RAG 操作进行 RESTful API 访问。这允许您将 LightRAG 作为服务运行并通过 HTTP 请求与其交互。
+PathCoRAG also provides a FastAPI-based server implementation for RESTful API access to RAG operations. This allows you to run PathCoRAG as a service and interact with it through HTTP requests.
+PathCoRAG 还提供基于 FastAPI 的服务器实现，用于对 RAG 操作进行 RESTful API 访问。这允许您将 PathCoRAG 作为服务运行并通过 HTTP 请求与其交互。
 
 ### 设置 API 服务器
 <details>
@@ -24,7 +24,7 @@ export EMBEDDING_MODEL="Your embedding model" # Optional: Defaults to "text-embe
 
 3. 运行API服务器:
 ```bash
-python examples/lightrag_api_openai_compatible_demo.py
+python examples/PathCoRAG_api_openai_compatible_demo.py
 ```
 
 服务器将启动于 `http://0.0.0.0:8020`.

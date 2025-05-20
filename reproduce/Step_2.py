@@ -4,7 +4,7 @@ from transformers import GPT2Tokenizer
 
 
 def openai_complete_if_cache(
-    model="gpt-4o", prompt=None, system_prompt=None, history_messages=[], **kwargs
+    model="gpt-4o-mini", prompt=None, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
     openai_client = OpenAI()
 
@@ -36,7 +36,7 @@ def get_summary(context, tot_tokens=2000):
     return summary
 
 
-clses = ["agriculture"]
+clses = ["legal"]
 for cls in clses:
     with open(f"../datasets/unique_contexts/{cls}_unique_contexts.json", mode="r") as f:
         unique_contexts = json.load(f)
@@ -69,7 +69,7 @@ for cls in clses:
         ...
     """
 
-    result = openai_complete_if_cache(model="gpt-4o", prompt=prompt)
+    result = openai_complete_if_cache(model="gpt-4o-mini", prompt=prompt)
 
     file_path = f"../datasets/questions/{cls}_questions.txt"
     with open(file_path, "w") as file:

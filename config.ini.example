@@ -5,7 +5,7 @@ password = your-password
 
 [mongodb]
 uri = mongodb+srv://name:password@your-cluster-address
-database = lightrag
+database = PathCoRAG
 graph = false
 
 [redis]

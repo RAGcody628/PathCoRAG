@@ -18,11 +18,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Copy only requirements files first to leverage Docker cache
 COPY requirements.txt .
-COPY lightrag/api/requirements.txt ./lightrag/api/
+COPY PathCoRAG/api/requirements.txt ./PathCoRAG/api/
 
 # Install dependencies
 RUN pip install --user --no-cache-dir -r requirements.txt
-RUN pip install --user --no-cache-dir -r lightrag/api/requirements.txt
+RUN pip install --user --no-cache-dir -r PathCoRAG/api/requirements.txt
 
 # Final stage
 FROM python:3.11-slim
@@ -31,7 +31,7 @@ WORKDIR /app
 
 # Copy only necessary files from builder
 COPY --from=builder /root/.local /root/.local
-COPY ./lightrag ./lightrag
+COPY ./PathCoRAG ./PathCoRAG
 COPY setup.py .
 COPY .env .
 
@@ -46,4 +46,4 @@ RUN mkdir -p /app/data/rag_storage /app/data/inputs
 EXPOSE 9621
 
 # Set entrypoint
-ENTRYPOINT ["python", "-m", "lightrag.api.lightrag_server"]
+ENTRYPOINT ["python", "-m", "PathCoRAG.api.PathCoRAG_server"]

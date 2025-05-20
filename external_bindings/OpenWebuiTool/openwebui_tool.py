@@ -1,8 +1,8 @@
 """
-OpenWebui Lightrag Integration Tool
+OpenWebui PathCoRAG Integration Tool
 ==================================
 
-This tool enables the integration and use of Lightrag within the OpenWebui environment,
+This tool enables the integration and use of PathCoRAG within the OpenWebui environment,
 providing a seamless interface for RAG (Retrieval-Augmented Generation) operations.
 
 Author: ParisNeo (parisneoai@gmail.com)
@@ -20,14 +20,14 @@ For more information, visit: https://github.com/ParisNeo/lollms
 Requirements:
     - Python 3.8+
     - OpenWebui
-    - Lightrag
+    - PathCoRAG
 """
 
 # Tool version
 __version__ = "1.0.0"
 __author__ = "ParisNeo"
 __author_email__ = "parisneoai@gmail.com"
-__description__ = "Lightrag integration for OpenWebui"
+__description__ = "PathCoRAG integration for OpenWebui"
 
 
 import requests
@@ -72,17 +72,17 @@ class MessageEventEmitter:
 
 class Tools:
     class Valves(BaseModel):
-        LIGHTRAG_SERVER_URL: str = Field(
+        PathCoRAG_SERVER_URL: str = Field(
             default="http://localhost:9621/query",
-            description="The base URL for the LightRag server",
+            description="The base URL for the PathCoRAG server",
         )
         MODE: Literal["naive", "local", "global", "hybrid"] = Field(
             default="hybrid",
-            description="The mode to use for the LightRag query. Options: naive, local, global, hybrid",
+            description="The mode to use for the PathCoRAG query. Options: naive, local, global, hybrid",
         )
         ONLY_NEED_CONTEXT: bool = Field(
             default=False,
-            description="If True, only the context is needed from the LightRag response",
+            description="If True, only the context is needed from the PathCoRAG response",
         )
         DEBUG_MODE: bool = Field(
             default=False,
@@ -109,38 +109,38 @@ class Tools:
         self.valves = self.Valves()
         self.headers = {
             "Content-Type": "application/json",
-            "User-Agent": "LightRag-Tool/1.0",
+            "User-Agent": "PathCoRAG-Tool/1.0",
         }
 
-    async def query_lightrag(
+    async def query_PathCoRAG(
         self,
         query: str,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Query the LightRag server and retrieve information.
+        Query the PathCoRAG server and retrieve information.
         This function must be called before answering the user question
-        :params query: The query string to send to the LightRag server.
-        :return: The response from the LightRag server in Markdown format or raw response.
+        :params query: The query string to send to the PathCoRAG server.
+        :return: The response from the PathCoRAG server in Markdown format or raw response.
         """
         self.status_emitter = StatusEventEmitter(__event_emitter__)
         self.message_emitter = MessageEventEmitter(__event_emitter__)
 
-        lightrag_url = self.valves.LIGHTRAG_SERVER_URL
+        PathCoRAG_url = self.valves.PathCoRAG_SERVER_URL
         payload = {
             "query": query,
             "mode": str(self.valves.MODE),
             "stream": False,
             "only_need_context": self.valves.ONLY_NEED_CONTEXT,
         }
-        await self.status_emitter.emit("Initializing Lightrag query..")
+        await self.status_emitter.emit("Initializing PathCoRAG query..")
 
         if self.valves.DEBUG_MODE:
             await self.message_emitter.emit(
                 "### Debug Mode Active\n\nDebugging information will be displayed.\n"
             )
             await self.message_emitter.emit(
-                "#### Payload Sent to LightRag Server\n```json\n"
+                "#### Payload Sent to PathCoRAG Server\n```json\n"
                 + json.dumps(payload, indent=4)
                 + "\n```\n"
             )
@@ -150,16 +150,16 @@ class Tools:
             self.headers["Authorization"] = f"Bearer {self.valves.KEY}"
 
         try:
-            await self.status_emitter.emit("Sending request to LightRag server")
+            await self.status_emitter.emit("Sending request to PathCoRAG server")
 
             response = requests.post(
-                lightrag_url, json=payload, headers=self.headers, timeout=120
+                PathCoRAG_url, json=payload, headers=self.headers, timeout=120
             )
             response.raise_for_status()
             data = response.json()
             await self.status_emitter.emit(
                 status="complete",
-                description="LightRag query Succeeded",
+                description="PathCoRAG query Succeeded",
                 done=True,
             )
 
@@ -168,7 +168,7 @@ class Tools:
                 try:
                     if self.valves.DEBUG_MODE:
                         await self.message_emitter.emit(
-                            "#### LightRag Server Response\n```json\n"
+                            "#### PathCoRAG Server Response\n```json\n"
                             + data["response"]
                             + "\n```\n"
                         )
@@ -182,17 +182,17 @@ class Tools:
             else:
                 if self.valves.DEBUG_MODE:
                     await self.message_emitter.emit(
-                        "#### LightRag Server Response\n```json\n"
+                        "#### PathCoRAG Server Response\n```json\n"
                         + data["response"]
                         + "\n```\n"
                     )
-                await self.status_emitter.emit("Lightrag query success")
+                await self.status_emitter.emit("PathCoRAG query success")
                 return data["response"]
 
         except requests.exceptions.RequestException as e:
             await self.status_emitter.emit(
                 status="error",
-                description=f"Error during LightRag query: {str(e)}",
+                description=f"Error during PathCoRAG query: {str(e)}",
                 done=True,
             )
             return json.dumps({"error": str(e)})

@@ -7,7 +7,7 @@ def read_long_description():
     try:
         return Path("README.md").read_text(encoding="utf-8")
     except FileNotFoundError:
-        return "A description of LightRAG is currently unavailable."
+        return "A description of PathCoRAG is currently unavailable."
 
 
 # Retrieving metadata from __init__.py
@@ -15,7 +15,7 @@ def retrieve_metadata():
     vars2find = ["__author__", "__version__", "__url__"]
     vars2readme = {}
     try:
-        with open("./lightrag/__init__.py") as f:
+        with open("./PathCoRAG/__init__.py") as f:
             for line in f.readlines():
                 for v in vars2find:
                     if line.startswith(v):
@@ -27,7 +27,7 @@ def retrieve_metadata():
                         )
                         vars2readme[v] = line.split("=")[1]
     except FileNotFoundError:
-        raise FileNotFoundError("Metadata file './lightrag/__init__.py' not found.")
+        raise FileNotFoundError("Metadata file './PathCoRAG/__init__.py' not found.")
 
     # Checking if all required variables are found
     missing_vars = [v for v in vars2find if v not in vars2readme]
@@ -55,7 +55,7 @@ def read_requirements():
 def read_api_requirements():
     api_deps = []
     try:
-        with open("./lightrag/api/requirements.txt") as f:
+        with open("./PathCoRAG/api/requirements.txt") as f:
             api_deps = [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
         print("Warning: API requirements.txt not found.")
@@ -65,7 +65,7 @@ def read_api_requirements():
 def read_extra_requirements():
     api_deps = []
     try:
-        with open("./lightrag/tools/lightrag_visualizer/requirements.txt") as f:
+        with open("./PathCoRAG/tools/PathCoRAG_visualizer/requirements.txt") as f:
             api_deps = [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
         print("Warning: API requirements.txt not found.")
@@ -77,11 +77,11 @@ long_description = read_long_description()
 requirements = read_requirements()
 
 setuptools.setup(
-    name="lightrag-hku",
+    name="PathCoRAG-hku",
     url=metadata["__url__"],
     version=metadata["__version__"],
     author=metadata["__author__"],
-    description="LightRAG: Simple and Fast Retrieval-Augmented Generation",
+    description="PathCoRAG: Simple and Fast Retrieval-Augmented Generation",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=setuptools.find_packages(
@@ -111,8 +111,8 @@ setuptools.setup(
     },
     entry_points={
         "console_scripts": [
-            "lightrag-server=lightrag.api.lightrag_server:main [api]",
-            "lightrag-viewer=lightrag.tools.lightrag_visualizer.graph_visualizer:main [tools]",
+            "PathCoRAG-server=PathCoRAG.api.PathCoRAG_server:main [api]",
+            "PathCoRAG-viewer=PathCoRAG.tools.PathCoRAG_visualizer.graph_visualizer:main [tools]",
         ],
     },
 )

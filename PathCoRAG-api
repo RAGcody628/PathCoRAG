@@ -1,0 +1,4 @@
+#!/bin/bash
+
+source /home/netman/PathCoRAG-xyj/venv/bin/activate
+PathCoRAG-server

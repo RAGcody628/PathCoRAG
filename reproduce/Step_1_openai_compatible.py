@@ -3,13 +3,13 @@ import json
 import time
 import numpy as np
 
-from lightrag import LightRAG
-from lightrag.utils import EmbeddingFunc
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+from PathCoRAG import PathCoRAG
+from PathCoRAG.utils import EmbeddingFunc
+from PathCoRAG.llm.openai import openai_complete_if_cache, openai_embed
 
 
 ## For Upstage API
-# please check if embedding_dim=4096 in lightrag.py and llm.py in lightrag direcotry
+# please check if embedding_dim=4096 in PathCoRAG.py and llm.py in PathCoRAG direcotry
 async def llm_model_func(
     prompt, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
@@ -18,7 +18,7 @@ async def llm_model_func(
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        api_key=os.getenv("UPSTAGE_API_KEY"),
+        api_key=os.getenv(""),
         base_url="https://api.upstage.ai/v1/solar",
         **kwargs,
     )
@@ -28,7 +28,7 @@ async def embedding_func(texts: list[str]) -> np.ndarray:
     return await openai_embed(
         texts,
         model="solar-embedding-1-large-query",
-        api_key=os.getenv("UPSTAGE_API_KEY"),
+        api_key=os.getenv(""),
         base_url="https://api.upstage.ai/v1/solar",
     )
 
@@ -60,7 +60,7 @@ WORKING_DIR = f"../{cls}"
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
 
-rag = LightRAG(
+rag = PathCoRAG(
     working_dir=WORKING_DIR,
     llm_model_func=llm_model_func,
     embedding_func=EmbeddingFunc(

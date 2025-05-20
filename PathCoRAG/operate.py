@@ -1,0 +1,4189 @@
+import asyncio
+import json
+import random
+import re
+from tqdm.asyncio import tqdm as tqdm_async
+from sklearn.preprocessing import normalize
+from typing import Any, Union
+import heapq
+from collections import Counter, defaultdict
+from multiprocessing import Pool, cpu_count
+from .utils import (
+    logger,
+    clean_str,
+    compute_mdhash_id,
+    decode_tokens_by_tiktoken,
+    encode_string_by_tiktoken,
+    is_float_regex,
+    list_of_list_to_csv,
+    pack_user_ass_to_openai_messages,
+    split_string_by_multi_markers,
+    truncate_list_by_token_size,
+    process_combine_contexts,
+    compute_args_hash,
+    handle_cache,
+    save_to_cache,
+    CacheData,
+    statistic_data,
+    get_conversation_turns,
+)
+from .base import (
+    BaseGraphStorage,
+    BaseKVStorage,
+    BaseVectorStorage,
+    TextChunkSchema,
+    QueryParam,
+)
+from .prompt import GRAPH_FIELD_SEP, PROMPTS
+import time
+import numpy as np
+import torch
+from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
+import networkx as nx
+from itertools import product
+from itertools import islice
+from collections import OrderedDict
+import itertools
+import os
+
+client = OpenAI(api_key="sk-")
+
+def chunking_by_token_size(
+    content: str,
+    split_by_character: Union[str, None] = None,
+    split_by_character_only: bool = False,
+    overlap_token_size: int = 128,
+    max_token_size: int = 1024,
+    tiktoken_model: str = "gpt-4o",
+) -> list[dict[str, Any]]:
+    tokens = encode_string_by_tiktoken(content, model_name=tiktoken_model)
+    results: list[dict[str, Any]] = []
+    if split_by_character:
+        raw_chunks = content.split(split_by_character)
+        new_chunks = []
+        if split_by_character_only:
+            for chunk in raw_chunks:
+                _tokens = encode_string_by_tiktoken(chunk, model_name=tiktoken_model)
+                new_chunks.append((len(_tokens), chunk))
+        else:
+            for chunk in raw_chunks:
+                _tokens = encode_string_by_tiktoken(chunk, model_name=tiktoken_model)
+                if len(_tokens) > max_token_size:
+                    for start in range(
+                        0, len(_tokens), max_token_size - overlap_token_size
+                    ):
+                        chunk_content = decode_tokens_by_tiktoken(
+                            _tokens[start : start + max_token_size],
+                            model_name=tiktoken_model,
+                        )
+                        new_chunks.append(
+                            (min(max_token_size, len(_tokens) - start), chunk_content)
+                        )
+                else:
+                    new_chunks.append((len(_tokens), chunk))
+        for index, (_len, chunk) in enumerate(new_chunks):
+            results.append(
+                {
+                    "tokens": _len,
+                    "content": chunk.strip(),
+                    "chunk_order_index": index,
+                }
+            )
+    else:
+        for index, start in enumerate(
+            range(0, len(tokens), max_token_size - overlap_token_size)
+        ):
+            chunk_content = decode_tokens_by_tiktoken(
+                tokens[start : start + max_token_size], model_name=tiktoken_model
+            )
+            results.append(
+                {
+                    "tokens": min(max_token_size, len(tokens) - start),
+                    "content": chunk_content.strip(),
+                    "chunk_order_index": index,
+                }
+            )
+    return results
+
+
+async def _handle_entity_relation_summary(
+    entity_or_relation_name: str,
+    description: str,
+    global_config: dict,
+) -> str:
+    """Handle entity relation summary
+    For each entity or relation, input is the combined description of already existing description and new description.
+    If too long, use LLM to summarize.
+    """
+    use_llm_func: callable = global_config["llm_model_func"]
+    llm_max_tokens = global_config["llm_model_max_token_size"]
+    tiktoken_model_name = global_config["tiktoken_model_name"]
+    summary_max_tokens = global_config["entity_summary_to_max_tokens"]
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+
+    tokens = encode_string_by_tiktoken(description, model_name=tiktoken_model_name)
+    if len(tokens) < summary_max_tokens:  # No need for summary
+        return description
+    prompt_template = PROMPTS["summarize_entity_descriptions"]
+    use_description = decode_tokens_by_tiktoken(
+        tokens[:llm_max_tokens], model_name=tiktoken_model_name
+    )
+    context_base = dict(
+        entity_name=entity_or_relation_name,
+        description_list=use_description.split(GRAPH_FIELD_SEP),
+        language=language,
+    )
+    use_prompt = prompt_template.format(**context_base)
+    logger.debug(f"Trigger summary: {entity_or_relation_name}")
+    summary = await use_llm_func(use_prompt, max_tokens=summary_max_tokens)
+    return summary
+
+
+async def _handle_single_entity_extraction(
+    record_attributes: list[str],
+    chunk_key: str,
+):
+    if len(record_attributes) < 4 or record_attributes[0] != '"entity"':
+        return None
+    # add this record as a node in the G
+    entity_name = clean_str(record_attributes[1].upper())
+    if not entity_name.strip():
+        return None
+    entity_type = clean_str(record_attributes[2].upper())
+    entity_description = clean_str(record_attributes[3])
+    entity_source_id = chunk_key
+    return dict(
+        entity_name=entity_name,
+        entity_type=entity_type,
+        description=entity_description,
+        source_id=entity_source_id,
+    )
+
+
+async def _handle_single_relationship_extraction(
+    record_attributes: list[str],
+    chunk_key: str,
+):
+    if len(record_attributes) < 5 or record_attributes[0] != '"relationship"':
+        return None
+    # add this record as edge
+    source = clean_str(record_attributes[1].upper())
+    target = clean_str(record_attributes[2].upper())
+    edge_description = clean_str(record_attributes[3])
+
+    edge_keywords = clean_str(record_attributes[4])
+    edge_source_id = chunk_key
+    weight = (
+        float(record_attributes[-1]) if is_float_regex(record_attributes[-1]) else 1.0
+    )
+    return dict(
+        src_id=source,
+        tgt_id=target,
+        weight=weight,
+        description=edge_description,
+        keywords=edge_keywords,
+        source_id=edge_source_id,
+        metadata={"created_at": time.time()},
+    )
+
+
+async def _merge_nodes_then_upsert(
+    entity_name: str,
+    nodes_data: list[dict],
+    knowledge_graph_inst: BaseGraphStorage,
+    global_config: dict,
+):
+    """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
+    already_entity_types = []
+    already_source_ids = []
+    already_description = []
+
+    already_node = await knowledge_graph_inst.get_node(entity_name)
+    if already_node is not None:
+        already_entity_types.append(already_node["entity_type"])
+        already_source_ids.extend(
+            split_string_by_multi_markers(already_node["source_id"], [GRAPH_FIELD_SEP])
+        )
+        already_description.append(already_node["description"])
+
+    entity_type = sorted(
+        Counter(
+            [dp["entity_type"] for dp in nodes_data] + already_entity_types
+        ).items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[0][0]
+    description = GRAPH_FIELD_SEP.join(
+        sorted(set([dp["description"] for dp in nodes_data] + already_description))
+    )
+    source_id = GRAPH_FIELD_SEP.join(
+        set([dp["source_id"] for dp in nodes_data] + already_source_ids)
+    )
+    description = await _handle_entity_relation_summary(
+        entity_name, description, global_config
+    )
+    node_data = dict(
+        entity_type=entity_type,
+        description=description,
+        source_id=source_id,
+    )
+    await knowledge_graph_inst.upsert_node(
+        entity_name,
+        node_data=node_data,
+    )
+    node_data["entity_name"] = entity_name
+    return node_data
+
+
+async def _merge_edges_then_upsert(
+    src_id: str,
+    tgt_id: str,
+    edges_data: list[dict],
+    knowledge_graph_inst: BaseGraphStorage,
+    global_config: dict,
+):
+    already_weights = []
+    already_source_ids = []
+    already_description = []
+    already_keywords = []
+
+    if await knowledge_graph_inst.has_edge(src_id, tgt_id):
+        already_edge = await knowledge_graph_inst.get_edge(src_id, tgt_id)
+        already_weights.append(already_edge["weight"])
+        already_source_ids.extend(
+            split_string_by_multi_markers(already_edge["source_id"], [GRAPH_FIELD_SEP])
+        )
+        already_description.append(already_edge["description"])
+        already_keywords.extend(
+            split_string_by_multi_markers(already_edge["keywords"], [GRAPH_FIELD_SEP])
+        )
+
+    weight = sum([dp["weight"] for dp in edges_data] + already_weights)
+    description = GRAPH_FIELD_SEP.join(
+        sorted(set([dp["description"] for dp in edges_data] + already_description))
+    )
+    keywords = GRAPH_FIELD_SEP.join(
+        sorted(set([dp["keywords"] for dp in edges_data] + already_keywords))
+    )
+    source_id = GRAPH_FIELD_SEP.join(
+        set([dp["source_id"] for dp in edges_data] + already_source_ids)
+    )
+    for need_insert_id in [src_id, tgt_id]:
+        if not (await knowledge_graph_inst.has_node(need_insert_id)):
+            await knowledge_graph_inst.upsert_node(
+                need_insert_id,
+                node_data={
+                    "source_id": source_id,
+                    "description": description,
+                    "entity_type": '"UNKNOWN"',
+                },
+            )
+    description = await _handle_entity_relation_summary(
+        f"({src_id}, {tgt_id})", description, global_config
+    )
+    await knowledge_graph_inst.upsert_edge(
+        src_id,
+        tgt_id,
+        edge_data=dict(
+            weight=weight,
+            description=description,
+            keywords=keywords,
+            source_id=source_id,
+        ),
+    )
+
+    edge_data = dict(
+        src_id=src_id,
+        tgt_id=tgt_id,
+        description=description,
+        keywords=keywords,
+    )
+
+    return edge_data
+
+
+async def extract_entities(
+    chunks: dict[str, TextChunkSchema],
+    knowledge_graph_inst: BaseGraphStorage,
+    entity_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    global_config: dict,
+    llm_response_cache: BaseKVStorage = None,
+) -> Union[BaseGraphStorage, None]:
+    use_llm_func: callable = global_config["llm_model_func"]
+    entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
+    enable_llm_cache_for_entity_extract: bool = global_config[
+        "enable_llm_cache_for_entity_extract"
+    ]
+
+    ordered_chunks = list(chunks.items())
+    # add language and example number params to prompt
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+    entity_types = global_config["addon_params"].get(
+        "entity_types", PROMPTS["DEFAULT_ENTITY_TYPES"]
+    )
+    example_number = global_config["addon_params"].get("example_number", None)
+    if example_number and example_number < len(PROMPTS["entity_extraction_examples"]):
+        examples = "\n".join(
+            PROMPTS["entity_extraction_examples"][: int(example_number)]
+        )
+    else:
+        examples = "\n".join(PROMPTS["entity_extraction_examples"])
+
+    example_context_base = dict(
+        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+        record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
+        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        entity_types=",".join(entity_types),
+        language=language,
+    )
+    # add example's format
+    examples = examples.format(**example_context_base)
+
+    entity_extract_prompt = PROMPTS["entity_extraction"]
+    context_base = dict(
+        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+        record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
+        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        entity_types=",".join(entity_types),
+        examples=examples,
+        language=language,
+    )
+
+    continue_prompt = PROMPTS["entiti_continue_extraction"]
+    if_loop_prompt = PROMPTS["entiti_if_loop_extraction"]
+
+    already_processed = 0
+    already_entities = 0
+    already_relations = 0
+
+    async def _user_llm_func_with_cache(
+        input_text: str, history_messages: list[dict[str, str]] = None
+    ) -> str:
+        if enable_llm_cache_for_entity_extract and llm_response_cache:
+            if history_messages:
+                history = json.dumps(history_messages, ensure_ascii=False)
+                _prompt = history + "\n" + input_text
+            else:
+                _prompt = input_text
+
+            arg_hash = compute_args_hash(_prompt)
+            cached_return, _1, _2, _3 = await handle_cache(
+                llm_response_cache,
+                arg_hash,
+                _prompt,
+                "default",
+                cache_type="extract",
+                force_llm_cache=True,
+            )
+            if cached_return:
+                logger.debug(f"Found cache for {arg_hash}")
+                statistic_data["llm_cache"] += 1
+                return cached_return
+            statistic_data["llm_call"] += 1
+            if history_messages:
+                res: str = await use_llm_func(
+                    input_text, history_messages=history_messages
+                )
+            else:
+                res: str = await use_llm_func(input_text)
+            await save_to_cache(
+                llm_response_cache,
+                CacheData(
+                    args_hash=arg_hash,
+                    content=res,
+                    prompt=_prompt,
+                    cache_type="extract",
+                ),
+            )
+            return res
+
+        if history_messages:
+            return await use_llm_func(input_text, history_messages=history_messages)
+        else:
+            return await use_llm_func(input_text)
+
+    async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
+        """ "Prpocess a single chunk
+        Args:
+            chunk_key_dp (tuple[str, TextChunkSchema]):
+                ("chunck-xxxxxx", {"tokens": int, "content": str, "full_doc_id": str, "chunk_order_index": int})
+        """
+        nonlocal already_processed, already_entities, already_relations
+        chunk_key = chunk_key_dp[0]
+        chunk_dp = chunk_key_dp[1]
+        content = chunk_dp["content"]
+        # hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
+        hint_prompt = entity_extract_prompt.format(
+            **context_base, input_text="{input_text}"
+        ).format(**context_base, input_text=content)
+
+        final_result = await _user_llm_func_with_cache(hint_prompt)
+        history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
+        for now_glean_index in range(entity_extract_max_gleaning):
+            glean_result = await _user_llm_func_with_cache(
+                continue_prompt, history_messages=history
+            )
+
+            history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
+            final_result += glean_result
+            if now_glean_index == entity_extract_max_gleaning - 1:
+                break
+
+            if_loop_result: str = await _user_llm_func_with_cache(
+                if_loop_prompt, history_messages=history
+            )
+            if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
+            if if_loop_result != "yes":
+                break
+
+        records = split_string_by_multi_markers(
+            final_result,
+            [context_base["record_delimiter"], context_base["completion_delimiter"]],
+        )
+
+        maybe_nodes = defaultdict(list)
+        maybe_edges = defaultdict(list)
+        for record in records:
+            record = re.search(r"\((.*)\)", record)
+            if record is None:
+                continue
+            record = record.group(1)
+            record_attributes = split_string_by_multi_markers(
+                record, [context_base["tuple_delimiter"]]
+            )
+            if_entities = await _handle_single_entity_extraction(
+                record_attributes, chunk_key
+            )
+            if if_entities is not None:
+                maybe_nodes[if_entities["entity_name"]].append(if_entities)
+                continue
+
+            if_relation = await _handle_single_relationship_extraction(
+                record_attributes, chunk_key
+            )
+            if if_relation is not None:
+                maybe_edges[(if_relation["src_id"], if_relation["tgt_id"])].append(
+                    if_relation
+                )
+        already_processed += 1
+        already_entities += len(maybe_nodes)
+        already_relations += len(maybe_edges)
+        now_ticks = PROMPTS["process_tickers"][
+            already_processed % len(PROMPTS["process_tickers"])
+        ]
+        logger.debug(
+            f"{now_ticks} Processed {already_processed} chunks, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
+        )
+        return dict(maybe_nodes), dict(maybe_edges)
+
+    results = []
+    for result in tqdm_async(
+        asyncio.as_completed([_process_single_content(c) for c in ordered_chunks]),
+        total=len(ordered_chunks),
+        desc="Level 2 - Extracting entities and relationships",
+        unit="chunk",
+        position=1,
+        leave=False,
+    ):
+        results.append(await result)
+
+    maybe_nodes = defaultdict(list)
+    maybe_edges = defaultdict(list)
+    for m_nodes, m_edges in results:
+        for k, v in m_nodes.items():
+            maybe_nodes[k].extend(v)
+        for k, v in m_edges.items():
+            maybe_edges[tuple(sorted(k))].extend(v)
+    logger.debug("Inserting entities into storage...")
+    all_entities_data = []
+    for result in tqdm_async(
+        asyncio.as_completed(
+            [
+                _merge_nodes_then_upsert(k, v, knowledge_graph_inst, global_config)
+                for k, v in maybe_nodes.items()
+            ]
+        ),
+        total=len(maybe_nodes),
+        desc="Level 3 - Inserting entities",
+        unit="entity",
+        position=2,
+        leave=False,
+    ):
+        all_entities_data.append(await result)
+
+    logger.debug("Inserting relationships into storage...")
+    all_relationships_data = []
+    for result in tqdm_async(
+        asyncio.as_completed(
+            [
+                _merge_edges_then_upsert(
+                    k[0], k[1], v, knowledge_graph_inst, global_config
+                )
+                for k, v in maybe_edges.items()
+            ]
+        ),
+        total=len(maybe_edges),
+        desc="Level 3 - Inserting relationships",
+        unit="relationship",
+        position=3,
+        leave=False,
+    ):
+        all_relationships_data.append(await result)
+
+    if not len(all_entities_data) and not len(all_relationships_data):
+        logger.warning(
+            "Didn't extract any entities and relationships, maybe your LLM is not working"
+        )
+        return None
+
+    if not len(all_entities_data):
+        logger.warning("Didn't extract any entities")
+    if not len(all_relationships_data):
+        logger.warning("Didn't extract any relationships")
+
+    if entity_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                "content": dp["entity_name"] + dp["description"],
+                "entity_name": dp["entity_name"],
+            }
+            for dp in all_entities_data
+        }
+        await entity_vdb.upsert(data_for_vdb)
+
+    if relationships_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
+                "src_id": dp["src_id"],
+                "tgt_id": dp["tgt_id"],
+                "content": dp["keywords"]
+                + dp["src_id"]
+                + dp["tgt_id"]
+                + dp["description"],
+                "metadata": {
+                    "created_at": dp.get("metadata", {}).get("created_at", time.time())
+                },
+            }
+            for dp in all_relationships_data
+        }
+        await relationships_vdb.upsert(data_for_vdb)
+
+    return knowledge_graph_inst
+
+
+async def kg_query(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+    prompt: str = "",
+) -> str:
+    # Handle cache
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    # Extract keywords using extract_keywords_only function which already supports conversation history
+    hl_keywords, ll_keywords = await extract_keywords_only(
+        query, query_param, global_config, hashing_kv
+    )
+    
+    logger.debug(f"High-level keywords: {hl_keywords}")
+    logger.debug(f"Low-level  keywords: {ll_keywords}")
+
+    # Handle empty keywords
+    if hl_keywords == [] and ll_keywords == []:
+        logger.warning("low_level_keywords and high_level_keywords is empty")
+        return PROMPTS["fail_response"]
+    if ll_keywords == [] and query_param.mode in ["local", "hybrid"]:
+        logger.warning(
+            "low_level_keywords is empty, switching from %s mode to global mode",
+            query_param.mode,
+        )
+        query_param.mode = "global"
+    if hl_keywords == [] and query_param.mode in ["global", "hybrid"]:
+        logger.warning(
+            "high_level_keywords is empty, switching from %s mode to local mode",
+            query_param.mode,
+        )
+        query_param.mode = "local"
+
+    ll_keywords = ", ".join(ll_keywords) if ll_keywords else ""
+    hl_keywords = ", ".join(hl_keywords) if hl_keywords else ""
+
+    logger.info("Using %s mode for query processing", query_param.mode)
+
+    # Build context
+    keywords = [ll_keywords, hl_keywords]
+    context = await _build_query_context(
+        keywords,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+    )
+    
+    print(f"[INFO] context 길이 : {len(context)}.")
+
+    if query_param.only_need_context:
+        return context
+    if context is None:
+        return PROMPTS["fail_response"]
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    sys_prompt_temp = prompt if prompt else PROMPTS["rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        context_data=context,
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # Save to cache
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+            cache_type="query",
+        ),
+    )
+    return response
+
+async def extract_keywords_only(
+    text: str,
+    param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Extract high-level and low-level keywords from the given 'text' using the LLM.
+    This method does NOT build the final RAG context or provide a final answer.
+    It ONLY extracts keywords (hl_keywords, ll_keywords).
+    """
+
+    # 1. Handle cache if needed - add cache type for keywords
+    args_hash = compute_args_hash(param.mode, text, cache_type="keywords")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, text, param.mode, cache_type="keywords"
+    )
+    if cached_response is not None:
+        try:
+            keywords_data = json.loads(cached_response)
+            return keywords_data["high_level_keywords"], keywords_data[
+                "low_level_keywords"
+            ]
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "Invalid cache format for keywords, proceeding with extraction"
+            )
+
+    # 2. Build the examples
+    example_number = global_config["addon_params"].get("example_number", None)
+    if example_number and example_number < len(PROMPTS["keywords_extraction_examples"]):
+        examples = "\n".join(
+            PROMPTS["keywords_extraction_examples"][: int(example_number)]
+        )
+    else:
+        examples = "\n".join(PROMPTS["keywords_extraction_examples"])
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+
+    # 3. Process conversation history
+    history_context = ""
+    if param.conversation_history:
+        history_context = get_conversation_turns(
+            param.conversation_history, param.history_turns
+        )
+
+    # 4. Build the keyword-extraction prompt
+    kw_prompt = PROMPTS["keywords_extraction"].format(
+        query=text, examples=examples, language=language, history=history_context
+    )
+
+    # 5. Call the LLM for keyword extraction
+    use_model_func = global_config["llm_model_func"]
+    result = await use_model_func(kw_prompt, keyword_extraction=True)
+
+    # 6. Parse out JSON from the LLM response
+    match = re.search(r"\{.*\}", result, re.DOTALL)
+    if not match:
+        logger.error("No JSON-like structure found in the LLM respond.")
+        return [], []
+    try:
+        keywords_data = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e}")
+        return [], []
+
+    hl_keywords = keywords_data.get("high_level_keywords", [])
+    ll_keywords = keywords_data.get("low_level_keywords", [])
+
+    # 7. Cache only the processed keywords with cache type
+    if hl_keywords or ll_keywords:
+        cache_data = {
+            "high_level_keywords": hl_keywords,
+            "low_level_keywords": ll_keywords,
+        }
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=json.dumps(cache_data),
+                prompt=text,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode=param.mode,
+                cache_type="keywords",
+            ),
+        )
+    return hl_keywords, ll_keywords
+
+async def mix_kg_vector_query(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+) -> str:
+    """
+    Hybrid retrieval implementation combining knowledge graph and vector search.
+
+    This function performs a hybrid search by:
+    1. Extracting semantic information from knowledge graph
+    2. Retrieving relevant text chunks through vector similarity
+    3. Combining both results for comprehensive answer generation
+    """
+    # 1. Cache handling
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash("mix", query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, "mix", cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    # 2. Execute knowledge graph and vector searches in parallel
+    async def get_kg_context():
+        try:
+            # Extract keywords using extract_keywords_only function which already supports conversation history
+            hl_keywords, ll_keywords = await extract_keywords_only(
+                query, query_param, global_config, hashing_kv
+            )
+
+            if not hl_keywords and not ll_keywords:
+                logger.warning("Both high-level and low-level keywords are empty")
+                return None
+
+            # Convert keyword lists to strings
+            ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
+            hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
+
+            # Set query mode based on available keywords
+            if not ll_keywords_str and not hl_keywords_str:
+                return None
+            elif not ll_keywords_str:
+                query_param.mode = "global"
+            elif not hl_keywords_str:
+                query_param.mode = "local"
+            else:
+                query_param.mode = "hybrid"
+
+            # Build knowledge graph context
+            context = await _build_query_context(
+                [ll_keywords_str, hl_keywords_str],
+                knowledge_graph_inst,
+                entities_vdb,
+                relationships_vdb,
+                text_chunks_db,
+                query_param,
+            )
+
+            return context
+
+        except Exception as e:
+            logger.error(f"Error in get_kg_context: {str(e)}")
+            return None
+
+    async def get_vector_context():
+        # Consider conversation history in vector search
+        augmented_query = query
+        if history_context:
+            augmented_query = f"{history_context}\n{query}"
+
+        try:
+            # Reduce top_k for vector search in hybrid mode since we have structured information from KG
+            mix_topk = min(10, query_param.top_k)
+            results = await chunks_vdb.query(augmented_query, top_k=mix_topk)
+            if not results:
+                return None
+
+            chunks_ids = [r["id"] for r in results]
+            chunks = await text_chunks_db.get_by_ids(chunks_ids)
+
+            valid_chunks = []
+            for chunk, result in zip(chunks, results):
+                if chunk is not None and "content" in chunk:
+                    # Merge chunk content and time metadata
+                    chunk_with_time = {
+                        "content": chunk["content"],
+                        "created_at": result.get("created_at", None),
+                    }
+                    valid_chunks.append(chunk_with_time)
+
+            if not valid_chunks:
+                return None
+
+            maybe_trun_chunks = truncate_list_by_token_size(
+                valid_chunks,
+                key=lambda x: x["content"],
+                max_token_size=query_param.max_token_for_text_unit,
+            )
+
+            if not maybe_trun_chunks:
+                return None
+
+            # Include time information in content
+            formatted_chunks = []
+            for c in maybe_trun_chunks:
+                chunk_text = c["content"]
+                if c["created_at"]:
+                    chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\n{chunk_text}"
+                formatted_chunks.append(chunk_text)
+
+            logger.info(f"Truncate {len(chunks)} to {len(formatted_chunks)} chunks")
+            return "\n--New Chunk--\n".join(formatted_chunks)
+        except Exception as e:
+            logger.error(f"Error in get_vector_context: {e}")
+            return None
+
+    # 3. Execute both retrievals in parallel
+    kg_context, vector_context = await asyncio.gather(
+        get_kg_context(), get_vector_context()
+    )
+
+    # 4. Merge contexts
+    if kg_context is None and vector_context is None:
+        return PROMPTS["fail_response"]
+
+    if query_param.only_need_context:
+        return {"kg_context": kg_context, "vector_context": vector_context}
+
+    # 5. Construct hybrid prompt
+    sys_prompt = PROMPTS["mix_rag_response"].format(
+        kg_context=kg_context
+        if kg_context
+        else "No relevant knowledge graph information found",
+        vector_context=vector_context
+        if vector_context
+        else "No relevant text information found",
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    # 6. Generate response
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+
+    # 清理响应内容
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+        # 7. Save cache - 只有在收集完整响应后才缓存
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=response,
+                prompt=query,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode="mix",
+                cache_type="query",
+            ),
+        )
+
+    return response
+
+async def ours_kg_query(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+    prompt: str = "",
+) -> str:
+    # Handle cache
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+    
+    # query extension
+    hl_extended_queries, ll_extended_queries = await query_extension_only(
+        query, query_param, global_config, hashing_kv
+    )
+    
+    logger.debug(f"high-level extended_queries: {hl_extended_queries}")
+    logger.debug(f"low-level extended_queries: {ll_extended_queries}")
+
+    # Handle empty extended_query
+    if hl_extended_queries == [] and ll_extended_queries:
+        logger.warning("extended_query is empty")
+        return PROMPTS["fail_response"]
+
+    logger.info("Using %s mode for query processing", query_param.mode)
+
+    # Build context
+    extended_queries = [query, hl_extended_queries, ll_extended_queries]
+    context = await ours_build_query_context(
+        extended_queries,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+    )
+    
+    # MAX_CONTEXT_LENGTH = 300000
+
+    # if len(context) > MAX_CONTEXT_LENGTH:
+    #     print(f"[WARN] Context 길이가 {MAX_CONTEXT_LENGTH}자를 초과하여 잘립니다.")
+        
+    # context = context[:MAX_CONTEXT_LENGTH]
+    
+    print(f"[INFO] context 길이 : {len(context)}.")
+
+    if query_param.only_need_context:
+        return context
+    if context is None:
+        return PROMPTS["fail_response"]
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    sys_prompt_temp = prompt if prompt else PROMPTS["ours_rag_response"]
+    
+    sys_prompt = sys_prompt_temp.format(
+        context_data=context,
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # Save to cache
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+            cache_type="query",
+        ),
+    )
+    return response
+
+async def query_extension_only(
+    text: str,
+    param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Extract query extension from the given 'text' using the LLM.
+    This method does NOT build the final RAG context or provide a final answer.
+    It ONLY extend query (extended query).
+    """
+
+    # 1. Handle cache if needed - add cache type for keywords
+    args_hash = compute_args_hash(param.mode, text, cache_type="extended queries")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, text, param.mode, cache_type="extended queries"
+    )
+    if cached_response is not None:
+        try:
+            extended_datas = json.loads(cached_response)
+            return extended_datas["extended queries"]
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "Invalid cache format for extended queries, proceeding with extension"
+            )
+
+    # 2. Build the query-extension prompt
+    if param.mode == "final_hop0":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_hop0"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_hop0"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_hop0"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_hop0"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode == "final_hop1":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_hop1"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_hop1"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_hop1"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_hop1"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode == "final_hop2":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_hop2"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_hop2"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_hop2"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_hop2"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode in ["finall", "final_node60", "final_node50", "final_node40", "final_node30", "final_node20", "final_node10", "final", "final_k1", "final_k2", "final_k3", "final_k4", "final_k5", "final_path5", "final_path15","final_path10", "final_path20", "final_path25", "final_path30", "final_path40", "final_path50", "final_random", "final_del"]:
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+            
+        kw_prompt = PROMPTS["query_extension"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode == "final_hop3":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_hop3"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_hop3"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_hop3"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_hop3"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode == "final_query2":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_query2"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_query2"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_query2"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_query2"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode == "final_query3":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_query3"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_query3"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_query3"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_query3"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+    elif param.mode == "final_query4":
+        # 2-1. Build the examples
+        example_number = global_config["addon_params"].get("example_number", None)
+        if example_number and example_number < len(PROMPTS["query_extension_examples_query4"]):
+            examples = "\n".join(
+                PROMPTS["query_extension_examples_query4"][: int(example_number)]
+            )
+        else:
+            examples = "\n".join(PROMPTS["query_extension_examples_query4"])
+        language = global_config["addon_params"].get(
+            "language", PROMPTS["DEFAULT_LANGUAGE"]
+        )
+
+        # 2-2. Process conversation history
+        history_context = ""
+        if param.conversation_history:
+            history_context = get_conversation_turns(
+                param.conversation_history, param.history_turns
+            )
+        kw_prompt = PROMPTS["query_extension_hop3"].format(
+            query=text, examples=examples, language=language, history=history_context
+        )
+
+    # 3. Call the LLM for query_extension
+    use_model_func = global_config["llm_model_func"]
+    result = await use_model_func(kw_prompt, query_extension=True)
+
+    # 4. Parse out JSON from the LLM response
+    match = re.search(r"\{.*\}", result, re.DOTALL)
+    if not match:
+        logger.error("No JSON-like structure found in the LLM respond.")
+        return [], []
+    try:
+        extended_datas = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e}")
+        return [], []
+
+    extended_queries = extended_datas.get("extended_queries", [])
+    
+    hl_extended_queries = list(extended_queries.keys())
+    ll_extended_queries = [extended_queries[hl] for hl in hl_extended_queries]
+    
+    # 5. Cache only the processed keywords with cache type
+    if hl_extended_queries or ll_extended_queries:
+        cache_data = {
+            "high_level_extended_queries": hl_extended_queries,
+            "low_level_extended_queries": ll_extended_queries,
+        }
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=json.dumps(cache_data),
+                prompt=text,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode=param.mode,
+                cache_type="extended queries",
+            ),
+        )
+    return hl_extended_queries, ll_extended_queries
+
+async def ours_extract_keywords_only(
+    text: str,
+    param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Extract ours keywords from the given 'text' using the LLM.
+    This method does NOT build the final RAG context or provide a final answer.
+    It ONLY extracts keywords (ours_keywords).
+    """
+
+    # 1. Handle cache if needed - add cache type for keywords
+    args_hash = compute_args_hash(param.mode, text, cache_type="ours_keywords")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, text, param.mode, cache_type="ours_keywords"
+    )
+
+    if cached_response is not None:
+        try:
+            keywords_data = json.loads(cached_response)
+            return keywords_data["ours_keywords"]
+        
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "Invalid cache format for keywords, proceeding with extraction"
+            )
+    
+    # 2. Build the examples
+    example_number = global_config["addon_params"].get("example_number", None)
+    if example_number and example_number < len(PROMPTS["ours_keywords_extraction_examples"]):
+        examples = "\n".join(
+            PROMPTS["ours_keywords_extraction_examples"][: int(example_number)]
+        )
+    else:
+        examples = "\n".join(PROMPTS["ours_keywords_extraction_examples"])
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+
+    # 3. Process conversation history
+    history_context = ""
+    if param.conversation_history:
+        history_context = get_conversation_turns(
+            param.conversation_history, param.history_turns
+        )
+
+    # 4. Build the keyword-extraction prompt
+    kw_prompt = PROMPTS["ours_keywords_extraction"].format(
+        query=text, examples=examples, language=language, history=history_context
+    )
+
+    # 5. Call the LLM for keyword extraction
+    use_model_func = global_config["llm_model_func"]
+    result = await use_model_func(kw_prompt, keyword_extraction=True)
+
+    # 6. Parse out JSON from the LLM response
+    match = re.search(r"\{.*\}", result, re.DOTALL)
+    if not match:
+        logger.error("No JSON-like structure found in the LLM respond.")
+        return [], []
+    try:
+        keywords_data = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e}")
+        return [], []
+
+    ours_keywords = keywords_data.get("keywords", [])
+
+    # 7. Cache only the processed keywords with cache type
+    if ours_keywords:
+        cache_data = {
+            "ours_keywords": ours_keywords,
+        }
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=json.dumps(cache_data),
+                prompt=text,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode=param.mode,
+                cache_type="ours_keywords",
+            ),
+        )
+    return ours_keywords
+
+async def _build_query_context(
+    query: list,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # ll_entities_context, ll_relations_context, ll_text_units_context = "", "", ""
+    # hl_entities_context, hl_relations_context, hl_text_units_context = "", "", ""
+
+    ll_keywords, hl_keywords = query[0], query[1]
+
+    if query_param.mode == "local":
+        entities_context, relations_context, text_units_context = await _get_node_data(
+            ll_keywords,
+            knowledge_graph_inst,
+            entities_vdb,
+            text_chunks_db,
+            query_param,
+        )
+    elif query_param.mode == "global":
+        entities_context, relations_context, text_units_context = await _get_edge_data(
+            hl_keywords,
+            knowledge_graph_inst,
+            relationships_vdb,
+            text_chunks_db,
+            query_param,
+        )
+    else:  # hybrid mode
+        ll_data, hl_data = await asyncio.gather(
+            _get_node_data(
+                ll_keywords,
+                knowledge_graph_inst,
+                entities_vdb,
+                text_chunks_db,
+                query_param,
+            ),
+            _get_edge_data(
+                hl_keywords,
+                knowledge_graph_inst,
+                relationships_vdb,
+                text_chunks_db,
+                query_param,
+            ),
+        )
+
+        (
+            ll_entities_context,
+            ll_relations_context,
+            ll_text_units_context,
+        ) = ll_data
+
+        (
+            hl_entities_context,
+            hl_relations_context,
+            hl_text_units_context,
+        ) = hl_data
+
+        entities_context, relations_context, text_units_context = combine_contexts(
+            [hl_entities_context, ll_entities_context],
+            [hl_relations_context, ll_relations_context],
+            [hl_text_units_context, ll_text_units_context],
+        )
+    # not necessary to use LLM to generate a response
+    if not entities_context.strip() and not relations_context.strip():
+        return None
+
+    return f"""
+-----Entities-----
+```csv
+{entities_context}
+```
+-----Relationships-----
+```csv
+{relations_context}
+```
+-----Sources-----
+```csv
+{text_units_context}
+```
+"""
+
+async def ours_build_query_context(
+    query: list,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    query, hl_extended_queries, ll_extended_queries = query[0], query[1], query[2]
+
+    if query_param.mode == "local":
+        entities_context, relations_context, text_units_context = await _get_node_data(
+            ll_extended_queries,
+            knowledge_graph_inst,
+            entities_vdb,
+            text_chunks_db,
+            query_param,
+        )
+    elif query_param.mode == "global":
+        entities_context, relations_context, text_units_context = await _get_edge_data(
+            hl_extended_queries,
+            knowledge_graph_inst,
+            relationships_vdb,
+            text_chunks_db,
+            query_param,
+        )
+    elif query_param.mode in ["finall", "final_query2", "final_query3", "final_query4", "final_hop1", "final_hop2", "final_hop3", "final_node60", "final_node50", "final_node40", "final_node30", "final_node20", "final_node10", "final", "final_k1", "final_k2", "final_k3", "final_k4", "final_k5", "final_path5", "final_path15", "final_path10", "final_path20", "final_path25", "final_path30", "final_path40", "final_path50", "final_random", "final_del"]:
+        extended_queries = [query, ll_extended_queries]
+        reasoning_path_lines, entities_context, relations_context, text_units_context = await ours_path_search(
+                extended_queries,
+                knowledge_graph_inst,
+                entities_vdb,
+                relationships_vdb,
+                text_chunks_db,
+                query_param,
+            )
+        if query_param.mode == "final_del":
+            return f"""
+        -----Entities-----
+        ```csv
+        {entities_context}
+        ```
+        -----Relationships-----
+        ```csv
+        {relations_context}
+        ```
+        """
+        else: 
+            return f"""
+        -----Reasoning paths----
+        ```graph
+        {chr(10).join(reasoning_path_lines)}
+        ```
+        -----Entities-----
+        ```csv
+        {entities_context}
+        ```
+        -----Relationships-----
+        ```csv
+        {relations_context}
+        ```
+        """
+
+# -----Sources-----
+#     ```csv
+#     {text_units_context}
+#     ```
+
+async def _get_node_data(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # get similar entities
+    results = await entities_vdb.query(query, top_k=query_param.top_k)
+    if not len(results):
+        return "", "", ""
+    
+    # get entity information
+    node_datas, node_degrees = await asyncio.gather(
+        asyncio.gather(
+            *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
+        ),
+        asyncio.gather(
+            *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in results]
+        ),
+    )
+
+    if not all([n is not None for n in node_datas]):
+        logger.warning("Some nodes are missing, maybe the storage is damaged")
+
+    node_datas = [
+        {**n, "entity_name": k["entity_name"], "rank": d}
+        for k, n, d in zip(results, node_datas, node_degrees)
+        if n is not None
+    ]  # what is this text_chunks_db doing.  dont remember it in airvx.  check the diagram.
+    
+    # get entitytext chunk
+    use_text_units, use_relations = await asyncio.gather(
+        _find_most_related_text_unit_from_entities(
+            node_datas, query_param, text_chunks_db, knowledge_graph_inst
+        ),
+        _find_most_related_edges_from_entities(
+            node_datas, query_param, knowledge_graph_inst
+        ),
+    )
+    logger.info(
+        f"Local query uses {len(node_datas)} entites, {len(use_relations)} relations, {len(use_text_units)} text units"
+    )
+    
+    # await save_to_node_graphml(query_param.mode, node_datas)
+    # await save_to_node_edge_graphml(query_param.mode, use_relations)
+
+    # build prompt
+    entites_section_list = [["id", "entity", "type", "description", "rank"]]
+    for i, n in enumerate(node_datas):
+        entites_section_list.append(
+            [
+                i,
+                n["entity_name"],
+                n.get("entity_type", "UNKNOWN"),
+                n.get("description", "UNKNOWN"),
+                n["rank"],
+            ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+
+    relations_section_list = [
+        [
+            "id",
+            "source",
+            "target",
+            "description",
+            "keywords",
+            "weight",
+            "rank",
+            "created_at",
+        ]
+    ]
+    for i, e in enumerate(use_relations):
+        created_at = e.get("created_at", "UNKNOWN")
+        # Convert timestamp to readable format
+        if isinstance(created_at, (int, float)):
+            created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+        relations_section_list.append(
+            [
+                i,
+                e["src_tgt"][0],
+                e["src_tgt"][1],
+                e["description"],
+                e["keywords"],
+                e["weight"],
+                e["rank"],
+                created_at,
+            ]
+        )
+    relations_context = list_of_list_to_csv(relations_section_list)
+
+    text_units_section_list = [["id", "content"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"]])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+    return entities_context, relations_context, text_units_context
+
+async def save_to_node_graphml(mode, node_datas):
+    file_path=f"{mode}_knowledge_graph.graphml"
+    
+    # Step 1: 파일이 있으면 불러오고, 없으면 새로 생성
+    if os.path.exists(file_path):
+        try:
+            G = nx.read_graphml(file_path)
+            print("기존 GraphML 로드 완료")
+        except Exception as e:
+            print(f"GraphML 로드 실패: {e}. 새로 생성합니다.")
+            os.remove(file_path)
+            G = nx.Graph()
+    else:
+        print("파일이 존재하지 않습니다. 새 그래프를 생성합니다.")
+        G = nx.Graph()
+    
+    # Step 2: 노드 추가 (node_datas를 기반으로)
+    if mode == "ours":
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            node["type"] = f"{mode}_step23_node"
+            G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+    elif mode == "ours1":
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            node["type"] = f"{mode}_step123_123_node"
+            G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+    elif mode == "hybrid":
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            node["type"] = f"{mode}_local_node"
+            G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+    elif mode in ["ours2", "ours3"]:
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+
+    try:
+        nx.write_graphml_lxml(G, file_path)  # XML 방식으로 저장
+        print(f"Nodeifno GraphML 저장 성공 (lxml): {file_path}")
+    except Exception as e:
+        print(f"GraphML 저장 실패: {e}")
+        
+async def save_to_node_edge_graphml(mode, edge_datas):
+    file_path=f"{mode}_knowledge_graph.graphml"
+    
+    # Step 1: 파일이 있으면 불러오고, 없으면 새로 생성
+    if os.path.exists(file_path):
+        try:
+            G = nx.read_graphml(file_path)
+            print("기존 GraphML 로드 완료")
+        except Exception as e:
+            print(f"GraphML 로드 실패: {e}. 새로 생성합니다.")
+            os.remove(file_path)
+            G = nx.Graph()
+    else:
+        print("파일이 존재하지 않습니다. 새 그래프를 생성합니다.")
+        G = nx.Graph()
+        
+    # Step 2: 엣지 추가 (edge_datas를 기반으로)
+    if mode == 'ours':
+        for edge in edge_datas:
+            src = edge["src_tgt"][0]
+            tgt = edge["src_tgt"][1]
+            
+            if not G.has_edge(src, tgt) or ("type" in G[src][tgt] and G[src][tgt]["type"] != f"{mode}_step1_edge"):
+                edge["type"] = f"{mode}_step23_edge"
+                G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+    elif mode == 'ours1':
+        for edge in edge_datas:
+            src = edge["src_tgt"][0]
+            tgt = edge["src_tgt"][1]
+            
+            if not G.has_edge(src, tgt) or ("type" in G[src][tgt] and G[src][tgt]["type"] != f"{mode}_step123_edge"):
+                edge["type"] = f"{mode}_step123_123_edge"
+                G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+    elif mode == 'hybrid':
+        for edge in edge_datas:
+            src = edge["src_tgt"][0]
+            tgt = edge["src_tgt"][1]
+            
+            if not G.has_edge(src, tgt) or ("type" in G[src][tgt] and G[src][tgt]["type"] != f"{mode}_global_edge"):
+                edge["type"] = f"{mode}_local_edge"
+                G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+    elif mode in ['ours2', 'ours3']:
+        for edge in edge_datas:
+            src = edge["src_tgt"][0]
+            tgt = edge["src_tgt"][1]
+            
+            if not G.has_edge(src, tgt):
+                edge["type"] = f"{mode}_node_edge"
+                G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+        
+    try:
+        nx.write_graphml_lxml(G, file_path)  # XML 방식으로 저장
+        print(f"Edgeinfo GraphML 저장 성공 (lxml): {file_path}")
+    except Exception as e:
+        print(f"GraphML 저장 실패: {e}")
+
+async def save_to_edge_graphml(mode, edge_datas):
+    file_path=f"{mode}_knowledge_graph.graphml"
+    
+    # Step 1: 파일이 있으면 불러오고, 없으면 새로 생성
+    if os.path.exists(file_path):
+        try:
+            G = nx.read_graphml(file_path)
+            print("기존 GraphML 로드 완료")
+        except Exception as e:
+            print(f"GraphML 로드 실패: {e}. 새로 생성합니다.")
+            os.remove(file_path)
+            G = nx.Graph()
+    else:
+        print("파일이 존재하지 않습니다. 새 그래프를 생성합니다.")
+        G = nx.Graph()
+        
+    # Step 2: 엣지 추가 (edge_datas를 기반으로)
+    if mode == 'ours':
+        for edge in edge_datas:
+            src = edge["src_id"]
+            tgt = edge["tgt_id"]
+            
+            edge["type"] = f"{mode}_step1_edge"
+            G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+    elif mode == 'ours1':
+        for edge in edge_datas:
+            src = edge["src_id"]
+            tgt = edge["tgt_id"]
+            
+            edge["type"] = f"{mode}_step123_edge"
+            G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+    elif mode == 'hybrid':
+        for edge in edge_datas:
+            src = edge["src_id"]
+            tgt = edge["tgt_id"]
+            
+            edge["type"] = f"{mode}_global_edge"
+            G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+    elif mode in ["ours2", "ours3"]:
+        for edge in edge_datas:
+            src = edge["src_id"]
+            tgt = edge["tgt_id"]
+            
+            G.add_edge(src, tgt, **{k: str(v) for k, v in edge.items()})  # 모든 속성을 저장
+        
+
+    try:
+        nx.write_graphml_lxml(G, file_path)  # XML 방식으로 저장
+        print(f"Edgeinfo GraphML 저장 성공 (lxml): {file_path}")
+    except Exception as e:
+        print(f"GraphML 저장 실패: {e}")
+        
+async def save_to_edge_node_graphml(mode, node_datas):
+    file_path=f"{mode}_knowledge_graph.graphml"
+    
+    # Step 1: 파일이 있으면 불러오고, 없으면 새로 생성
+    if os.path.exists(file_path):
+        try:
+            G = nx.read_graphml(file_path)
+            print("기존 GraphML 로드 완료")
+        except Exception as e:
+            print(f"GraphML 로드 실패: {e}. 새로 생성합니다.")
+            os.remove(file_path)
+            G = nx.Graph()
+    else:
+        print("파일이 존재하지 않습니다. 새 그래프를 생성합니다.")
+        G = nx.Graph()
+    
+    # Step 2: 노드 추가 (node_datas를 기반으로)
+    if mode == "ours":
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            if ((entity_name in G) and "type" not in G.nodes[entity_name]) or ("type" in G.nodes[entity_name] and G.nodes[entity_name]["type"] != f"{mode}_step23_node"):
+                node["type"] = f"{mode}_step1_node"
+                G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+    elif mode == "ours1":
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            if ((entity_name in G) and "type" not in G.nodes[entity_name]) or ("type" in G.nodes[entity_name] and G.nodes[entity_name]["type"] != f"{mode}_step123_123_node"):
+                node["type"] = f"{mode}_step123_node"
+                G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+    elif mode == "hybrid":
+        for node in node_datas:
+            entity_name = node["entity_name"]
+            
+            if ((entity_name in G) and "type" not in G.nodes[entity_name]) or ("type" in G.nodes[entity_name] and G.nodes[entity_name]["type"] != f"{mode}_local_node"):
+                node["type"] = f"{mode}_global_node"
+                G.add_node(entity_name, **{k: str(v) for k, v in node.items()})  # 모든 속성을 저장
+    
+
+    try:
+        nx.write_graphml_lxml(G, file_path)  # XML 방식으로 저장
+        print(f"Nodeifno GraphML 저장 성공 (lxml): {file_path}")
+    except Exception as e:
+        print(f"GraphML 저장 실패: {e}")
+        
+def mean_pool(vecs):
+    return np.mean(vecs, axis=0)
+
+def cos_sim(a, b):
+    a = np.ravel(a) 
+    b = np.ravel(b)
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+        return 0.0
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+async def ours_path_search(
+    extended_queries,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+   
+    query = extended_queries[0]
+    ll_extended_queries = extended_queries[1]
+
+    # 1. 단계별 노드 추출
+    hl_node_maps = []
+    node_stage_assignment = {}
+    for stage_idx, ll_queries in enumerate(ll_extended_queries):
+        node_rank_map = {}
+        for ll in ll_queries:
+            if query_param.mode == "final_node60":
+                top_nodes = await entities_vdb.query(ll, top_k=60)
+            elif query_param.mode == "final_node50":
+                top_nodes = await entities_vdb.query(ll, top_k=50)
+            elif query_param.mode == "final_node40":
+                top_nodes = await entities_vdb.query(ll, top_k=40)
+            elif query_param.mode == "final_node30":
+                top_nodes = await entities_vdb.query(ll, top_k=30)
+            elif query_param.mode == "final_node20":
+                top_nodes = await entities_vdb.query(ll, top_k=20)
+            elif query_param.mode == "final_node10":
+                top_nodes = await entities_vdb.query(ll, top_k=10)
+            else:
+                top_nodes = await entities_vdb.query(ll, top_k=50)
+                
+            for rank, node in enumerate(top_nodes):
+                node_id = node["id"]
+                if node_id not in node_rank_map or rank < node_rank_map[node_id][0]:
+                    node_rank_map[node_id] = (rank, node)
+        hl_node_maps.append(node_rank_map)
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            if node_id not in node_stage_assignment or rank < node_stage_assignment[node_id][0]:
+                node_stage_assignment[node_id] = (rank, stage_idx)
+
+    num_stages = len(hl_node_maps)
+    hl_node_sets = [[] for _ in range(num_stages)]
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            assigned_stage = node_stage_assignment[node_id][1]
+            if assigned_stage == stage_idx:
+                hl_node_sets[stage_idx].append(node)
+
+    # 2. 관계 임베딩 사전 계산
+    embedding_func = query_param.addon_params["embedding_func"]
+    query_vec_np = np.ravel(await embedding_func(query))
+    query_vec = torch.tensor(query_vec_np, dtype=torch.float32, device="cuda")
+    query_vec = query_vec / torch.norm(query_vec)
+
+    rel_matrix_np = relationships_vdb.client_storage["matrix"]
+    rel_data = relationships_vdb.client_storage["data"]
+    rel_matrix = torch.tensor(rel_matrix_np, dtype=torch.float32, device="cuda")
+    rel_matrix = rel_matrix / torch.norm(rel_matrix, dim=1, keepdim=True)
+
+    cos_sims = torch.matmul(rel_matrix, query_vec)
+    cos_sims_cpu = cos_sims.cpu().numpy()
+    top_edge_threshold = 0.2
+    high_sim_edge_indices = set(np.where(cos_sims_cpu > top_edge_threshold)[0])
+    edge_key_to_idx = {(d["src_id"], d["tgt_id"]): i for i, d in enumerate(rel_data)}
+
+    # 3. 단계별 경로 + top30 추출
+    G = knowledge_graph_inst._graph
+    step_top_paths = []
+    if query_param.mode == "final_k1":
+        k_num = 1
+    elif query_param.mode == "final_k2":
+        k_num = 2
+    elif query_param.mode == "final_k3":
+        k_num = 3
+    elif query_param.mode == "final_k4":
+        k_num = 4
+    elif query_param.mode == "final_k5":
+        k_num = 5
+    else:
+        k_num = 4
+        
+    for i in range(num_stages - 1):
+        step_paths = []
+        for s in hl_node_sets[i]:
+            for t in hl_node_sets[i + 1]:
+                try:
+                    raw_paths = nx.shortest_simple_paths(G, source=s["entity_name"], target=t["entity_name"])
+                    for path_node_names in itertools.islice(raw_paths, k_num):
+                        path_dicts = []
+                        for name in path_node_names:
+                            try:
+                                node = await knowledge_graph_inst.get_node(name)
+                                node["entity_name"] = name
+                                path_dicts.append(node)
+                            except Exception:
+                                break
+                        else:
+                            step_paths.append(path_dicts)
+                except Exception:
+                    continue
+
+        valid_step_paths, edge_indices_list = [], []
+        for path in step_paths:
+            edge_idxs = [
+                edge_key_to_idx.get((path[i]["entity_name"], path[i + 1]["entity_name"]))
+                for i in range(len(path) - 1)
+            ]
+            edge_idxs = [idx for idx in edge_idxs if idx is not None and idx in high_sim_edge_indices]
+            if edge_idxs:
+                valid_step_paths.append(path)
+                edge_indices_list.append(edge_idxs)
+
+        if edge_indices_list:
+            max_len = max(len(idxs) for idxs in edge_indices_list)
+            padded_np = np.full((len(edge_indices_list), max_len), -1, dtype=np.int64)
+            for j, idxs in enumerate(edge_indices_list):
+                padded_np[j, :len(idxs)] = idxs
+            padded_indices = torch.from_numpy(padded_np).to("cuda")
+            mask = (padded_indices != -1).float()
+            path_sims = cos_sims[padded_indices]
+            sum_sims = (path_sims * mask).sum(dim=1)
+            count_sims = mask.sum(dim=1)
+            avg_scores = sum_sims / count_sims
+            avg_scores_np = avg_scores.cpu().numpy()
+
+            if query_param.mode == "final_path5":
+                top_k = heapq.nlargest(5, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path10":
+                top_k = heapq.nlargest(10, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path15":
+                top_k = heapq.nlargest(15, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path20":
+                top_k = heapq.nlargest(20, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path25":
+                top_k = heapq.nlargest(25, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path30":
+                top_k = heapq.nlargest(30, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path40":
+                top_k = heapq.nlargest(40, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_path50":
+                top_k = heapq.nlargest(50, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            elif query_param.mode == "final_random":
+                selected_indices = random.sample(range(len(valid_step_paths)), 15)
+                top_k = [(0.0, valid_step_paths[i]) for i in selected_indices]
+            else:
+                top_k = heapq.nlargest(15, zip(avg_scores_np, valid_step_paths), key=lambda x: x[0])
+            step_top_paths.append(top_k)
+        else:
+            step_top_paths.append([])
+
+    # 4. 경로 연결 (완전한 경로만)
+    # def merge_paths(paths_per_step):
+    #     merged_paths = [[p] for p in paths_per_step[0]]
+    #     for step in range(1, len(paths_per_step)):
+    #         new_merged = []
+    #         next_step = paths_per_step[step]
+    #         next_start_map = defaultdict(list)
+    #         for score, path in next_step:
+    #             next_start_map[path[0]["entity_name"]].append((score, path))
+    #         for partial in merged_paths:
+    #             last_path = partial[-1][1]
+    #             last_node = last_path[-1]["entity_name"]
+    #             if last_node in next_start_map:
+    #                 for score, np in next_start_map[last_node]:
+    #                     new_merged.append(partial + [(score, np)])
+    #         merged_paths = new_merged
+    #     return merged_paths
+
+    # merged_paths = merge_paths(step_top_paths)
+    # fully_connected_paths = [mp for mp in merged_paths if len(mp) == len(step_top_paths)]
+
+    # 5. 정보 수집
+    reasoning_path_lines = []
+    all_nodes = OrderedDict()
+    all_edge_pairs = set()
+    all_chunk_ids = set()
+    # 추론 경로 수집
+    for step_idx, step_paths in enumerate(step_top_paths):
+        for rank, (_, path) in enumerate(step_paths):
+            node_names = [node.get("entity_name") for node in path]
+            reasoning_path_lines.append(f"[S{step_idx+1}:{rank+1}] " + " → ".join(node_names))
+            for i, node in enumerate(path):
+                node_name = node.get("entity_name")
+                if node_name not in all_nodes:
+                    all_nodes[node_name] = node
+                if i < len(path) - 1:
+                    src = node.get("entity_name")
+                    tgt = path[i + 1].get("entity_name")
+                    all_edge_pairs.add((src, tgt))
+                    
+    # for rank, multi_step_path in enumerate(fully_connected_paths):
+    #     node_names = []
+    #     for idx, (_, path) in enumerate(multi_step_path):
+    #         names = [node.get("entity_name") for node in path]
+    #         if idx > 0:
+    #             names = names[1:]
+    #         node_names.extend(names)
+
+    #         for i, node in enumerate(path):
+    #             node_name = node.get("entity_name")
+    #             if node_name not in all_nodes:
+    #                 all_nodes[node_name] = node
+    #             if i < len(path) - 1:
+    #                 src = node.get("entity_name")
+    #                 tgt = path[i + 1].get("entity_name")
+    #                 all_edge_pairs.add((src, tgt))
+    #     reasoning_path_lines.append(f"[{rank + 1}] " + " → ".join(node_names))
+
+    # Entity 수집
+    entites_section_list = [["id", "entity", "type", "description"]]
+    for i, (entity_name, node) in enumerate(all_nodes.items()):
+        try:
+            type_ = node.get("entity_type", "")
+            description = node.get("description", "")
+            all_chunk_ids.add(node.get("source_id", ""))
+            entites_section_list.append([i, entity_name, type_, description])
+        except Exception:
+            continue
+
+    # Relation 수집
+    relations_section_list = [["id", "source", "target", "description", "keywords"]]
+    for i, (src, tgt) in enumerate(all_edge_pairs):
+        try:
+            edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+            if isinstance(edge_data, dict):
+                desc = edge_data.get("description", "")
+                keywords = edge_data.get("keywords", "")
+                all_chunk_ids.add(edge_data.get("source_id", ""))
+                relations_section_list.append([i, src, tgt, desc, keywords])
+        except Exception:
+            continue
+
+    # Text 수집
+    text_units_section_list = [["id", "content"]]
+    for i, cid in enumerate(all_chunk_ids):
+        try:
+            text_data = await text_chunks_db.get_by_id(cid)
+            if text_data:
+                content = text_data.get('content', "")
+                text_units_section_list.append([i, content])
+        except Exception:
+            continue
+
+    # CSV 변환
+    entities_context = list_of_list_to_csv(entites_section_list)
+    relations_context = list_of_list_to_csv(relations_section_list)
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+
+    return reasoning_path_lines, entities_context, relations_context, text_units_context
+
+async def ours_path_search_origin(
+    extended_queries,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # 1. 단계별 노드 집합 추출 (각 단계별 중복 제거 포함)
+    query = extended_queries[0]
+    ll_extended_queries = extended_queries[1]
+
+    hl_node_maps = []
+    
+    all_candidate_entity_names = set()
+
+    total_ll_count = sum(len(ll_queries) for ll_queries in ll_extended_queries)
+    logger.info(f"Total number of ll queries: {total_ll_count}")
+    for ll_queries in ll_extended_queries:
+        node_rank_map = {}
+        for ll in ll_queries:
+            top_nodes = await entities_vdb.query(ll, top_k=50)
+            for rank, node in enumerate(top_nodes):
+                node_id = node["id"]
+                entity_name = node["entity_name"]
+                all_candidate_entity_names.add(entity_name)
+                
+                if node_id not in node_rank_map or rank < node_rank_map[node_id][0]:
+                    node_rank_map[node_id] = (rank, node)
+        hl_node_maps.append(node_rank_map)
+
+    node_stage_assignment = {}
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            if node_id not in node_stage_assignment or rank < node_stage_assignment[node_id][0]:
+                node_stage_assignment[node_id] = (rank, stage_idx)
+
+    num_stages = len(hl_node_maps)
+    hl_node_sets = [[] for _ in range(num_stages)]
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            assigned_stage = node_stage_assignment[node_id][1]
+            if assigned_stage == stage_idx:
+                hl_node_sets[stage_idx].append(node)
+    
+    # 예외 처리(hl1 node들만 뽑힌 경우)    
+    if len(hl_node_sets) == 1:
+        single_stage_nodes = hl_node_sets[0]
+        
+        all_nodes = {}
+        all_chunk_ids = set()
+        
+        for node in single_stage_nodes:
+            entity_name = node["entity_name"]
+            try:
+                graph_node = await knowledge_graph_inst.get_node(entity_name)
+                all_nodes[entity_name] = graph_node
+                
+                chunk_id = graph_node.get("source_id", "")
+                if chunk_id:
+                    all_chunk_ids.add(chunk_id)
+
+            except Exception as e:
+                print(f"[ERROR in get_node] entity_name={entity_name}, err={e}")
+                continue
+            
+        entites_section_list = [["id", "entity", "type", "description"]]
+        for i, (entity_name, node) in enumerate(all_nodes.items()):
+            try:
+                type_ = node.get("entity_type", "")
+                description = node.get("description", "")
+                entites_section_list.append([i, entity_name, type_, description])
+            except Exception as e:
+                print(f"[ERROR in get_node] entity_name={entity_name}, err={e}")
+                continue
+
+        text_units_section_list = [["id", "content"]]
+        for i, cid in enumerate(all_chunk_ids):
+            try:
+                text_data = await text_chunks_db.get_by_id(cid)
+                if text_data:
+                    content = text_data.get('content', "")
+                    text_units_section_list.append([i, content])
+            except Exception as e:
+                print(f"[ERROR in get_by_id] cid={cid}, err={e}")
+                continue
+
+        # CSV 생성
+        entities_context = list_of_list_to_csv(entites_section_list)
+        text_units_context = list_of_list_to_csv(text_units_section_list)
+
+        # Reasoning path와 relation context는 비워서 반환
+        return [], entities_context, "", text_units_context
+        
+    # 2. 단계 간 경로 탐색
+    all_step_paths = []
+
+    G = knowledge_graph_inst._graph
+
+    for i in range(len(hl_node_sets) - 1):
+        source_nodes = hl_node_sets[i]
+        target_nodes = hl_node_sets[i + 1]
+
+        step_paths = []
+        start = time.time()
+        max_paths_per_pair = 4
+        for s in source_nodes:
+            for t in target_nodes:
+                try:
+                    raw_paths = nx.shortest_simple_paths(G, source=s["entity_name"], target=t["entity_name"])
+                    for path_node_names in itertools.islice(raw_paths, max_paths_per_pair):
+                        path_dicts = []
+                        for name in path_node_names:
+                            try:
+                                node = await knowledge_graph_inst.get_node(name)
+                                node["entity_name"] = name
+                                path_dicts.append(node)
+                            except Exception as e:
+                                print(f"[SKIP] failed to get node for name={name}: {e}")
+                                break
+                        else:
+                            step_paths.append(path_dicts)
+                except Exception as e:
+                    continue
+
+        all_step_paths.append(step_paths)
+        end = time.time()
+        print(f"실행 시간: {end - start:.5f} 초")
+        print(f"[INFO] Step {i+1}: {len(step_paths)} paths found between hl{i+1} → hl{i+2}")
+        start = time.time()
+        
+    merged_paths = [[path] for path in all_step_paths[0]]
+    
+    for step in range(1, len(all_step_paths)):
+        new_merged_paths = []
+        current_step_paths = all_step_paths[step]
+
+        used_paths = set()
+
+        start_node_to_paths = defaultdict(list)
+        
+        for path in current_step_paths:
+            start_node = path[0]["entity_name"]
+            start_node_to_paths[start_node].append(path)
+
+        for merged in merged_paths:
+            last_path = merged[-1]
+            last_node = last_path[-1]
+            last_node_name = last_node["entity_name"]
+
+            if last_node_name in start_node_to_paths:
+                for next_path in start_node_to_paths[last_node_name]:
+                    new_merged_paths.append(merged + [next_path])
+            else:
+                new_merged_paths.append(merged)
+
+        for idx, path in enumerate(current_step_paths):
+            if idx not in used_paths:
+                new_merged_paths.append([path])
+
+        merged_paths = new_merged_paths
+    
+    full_length = len(all_step_paths)  
+    fully_connected_paths = [mp for mp in merged_paths if len(mp) == full_length]
+    
+    end = time.time()
+    print(f"실행 시간: {end - start:.5f} 초")
+    start = time.time()
+    
+    print(f"[INFO] Step 3: {len(fully_connected_paths)} paths hl1 -> hl2 -> hl3")
+    print(f"[INFO] All merged paths (including partial): {len(merged_paths)}")
+
+    # 3. 경로 점수 계산 및 경로 선택
+    embedding_func = query_param.addon_params["embedding_func"]
+    query_vec_np = np.ravel(await embedding_func(query))  
+    query_vec = torch.tensor(query_vec_np, dtype=torch.float32, device="cuda")
+    query_vec = query_vec / torch.norm(query_vec)
+
+    rel_matrix_np = relationships_vdb.client_storage["matrix"] 
+    rel_data = relationships_vdb.client_storage["data"]
+
+    rel_matrix = torch.tensor(rel_matrix_np, dtype=torch.float32, device="cuda")
+    rel_matrix = rel_matrix / torch.norm(rel_matrix, dim=1, keepdim=True) 
+
+    cos_sims = torch.matmul(rel_matrix, query_vec)
+    cos_sims_cpu = cos_sims.cpu().numpy()
+
+    top_edge_threshold = 0.2 
+    high_sim_edge_indices = set(np.where(cos_sims_cpu > top_edge_threshold)[0])
+
+    edge_key_to_idx = {
+        (d["src_id"], d["tgt_id"]): i for i, d in enumerate(rel_data)
+    }
+
+    path_edge_indices = []
+    valid_path_refs = []
+
+    for multi_step_path in merged_paths:
+        edge_idxs = [
+            edge_key_to_idx.get((path[i]["entity_name"], path[i+1]["entity_name"]))
+            for path in multi_step_path
+            for i in range(len(path) - 1)
+        ]
+        edge_idxs = [idx for idx in edge_idxs if idx is not None and idx in high_sim_edge_indices]
+        
+        if edge_idxs:
+            path_edge_indices.append(edge_idxs)
+            valid_path_refs.append(multi_step_path)
+
+    print(f"[INFO] Filtered valid paths after top-edge filtering: {len(path_edge_indices)}")
+
+    if not path_edge_indices:
+        print("[WARN] No valid paths remain after filtering.")
+        top_paths = []
+    else:
+        max_len = max(len(idxs) for idxs in path_edge_indices)
+        num_paths = len(path_edge_indices)
+
+        padded_np = np.full((num_paths, max_len), -1, dtype=np.int64)
+        for i, idxs in enumerate(path_edge_indices):
+            padded_np[i, :len(idxs)] = idxs
+
+        padded_indices = torch.from_numpy(padded_np).to("cuda")
+        mask = (padded_indices != -1).float()
+
+        path_sims = cos_sims[padded_indices] 
+        sum_sims = (path_sims * mask).sum(dim=1)
+        count_sims = mask.sum(dim=1)
+        avg_scores = sum_sims / count_sims  
+
+        avg_scores_np = avg_scores.cpu().numpy()
+        
+        if query_param.mode == "final_wo_rerank":
+            indices = list(range(len(valid_path_refs)))
+            random.shuffle(indices)
+            selected_indices = indices[:30]
+            top_paths = [(0.0, valid_path_refs[i]) for i in selected_indices]
+        else:
+            top_paths = heapq.nlargest(30, zip(avg_scores_np, valid_path_refs), key=lambda x: x[0])
+
+    end = time.time()
+    print(f"실행 시간: {end - start:.2f} 초")
+    print(f"[INFO] Score calculation complete.")
+        
+    # 4. 정보 수집
+    # 1) 추론 경로 수집
+    reasoning_path_lines = []
+    all_nodes = OrderedDict()
+    all_edge_pairs = set()
+    all_chunk_ids = set()
+    used_entity_names = set()
+
+    for rank, (_, multi_step_path) in enumerate(top_paths):
+        node_names = []
+        
+        for idx, path in enumerate(multi_step_path):
+            names = [node.get("entity_name") for node in path]
+
+            if idx > 0:
+                # 첫 번째 노드는 이전 path의 마지막과 중복되므로 제거
+                names = names[1:]
+            
+            node_names.extend(names)
+
+            for i in range(len(path)):
+                node = path[i]
+                node_name = node.get("entity_name")
+                used_entity_names.add(node_name)
+
+                if node_name not in all_nodes:
+                    all_nodes[node_name] = node
+
+                if i < len(path) - 1:
+                    src = path[i].get("entity_name")
+                    tgt = path[i + 1].get("entity_name")
+                    all_edge_pairs.add((src, tgt))
+
+        reasoning_path_lines.append(f"[{rank + 1}] " + " → ".join(node_names))
+
+    # 2) Entity 정보 수집
+    entites_section_list = [["id", "entity", "type", "description"]]
+    for i, (entity_name, node) in enumerate(all_nodes.items()):
+        try:
+            type_ = node.get("entity_type", "")
+            description = node.get("description", "")
+            all_chunk_ids.add(node.get("source_id", ""))
+
+            entites_section_list.append([i, entity_name, type_, description])
+        except Exception as e:
+            print(f"[ERROR in get_node] entity_name ={entity_name}, err={e}")
+            continue
+
+    # 3) Relation 정보 수집
+    relations_section_list = [["id", "source", "target", "description", "keywords"]]
+    for i, (src_tgt) in enumerate(all_edge_pairs):
+        try:
+            src, tgt = src_tgt
+            edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+            if isinstance(edge_data, dict):
+                desc = edge_data.get("description", "")
+                keywords = edge_data.get("keywords", "")
+                all_chunk_ids.add(edge_data.get("source_id", ""))
+                
+                relations_section_list.append([i, src, tgt, desc, keywords])
+        except Exception as e:
+            print(f"[ERROR in get_edge] {src} → {tgt}, err={e}")
+            continue
+
+    # 4) Text 정보 수집
+    text_units_section_list = [["id", "content"]]
+    for i, cid in enumerate(all_chunk_ids):
+        try:
+            text_data = await text_chunks_db.get_by_id(cid)
+            if text_data:
+                content = text_data.get('content', "")
+                text_units_section_list.append([i, content])
+        except Exception as e:
+            print(f"[ERROR in get_by_id] cid={cid}, err={e}")
+            continue
+
+    # 5) CSV 생성
+    entities_context = list_of_list_to_csv(entites_section_list)
+    relations_context = list_of_list_to_csv(relations_section_list)
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+    if query_param.mode == "final_wo_reasoningcontext":
+        reasoning_path_lines = []
+
+    return reasoning_path_lines, entities_context, relations_context, text_units_context
+
+async def ours_path_search_full_path_only(
+    extended_queries,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # 1. 단계별 노드 집합 추출 (각 단계별 중복 제거 포함)
+    query = extended_queries[0]
+    ll_extended_queries = extended_queries[1]
+
+    hl_node_maps = []
+    all_candidate_entity_names = set()
+
+    for ll_queries in ll_extended_queries:
+        node_rank_map = {}
+        for ll in ll_queries:
+            top_nodes = await entities_vdb.query(ll, top_k=50)
+            for rank, node in enumerate(top_nodes):
+                node_id = node["id"]
+                entity_name = node["entity_name"]
+                all_candidate_entity_names.add(entity_name)
+                if node_id not in node_rank_map or rank < node_rank_map[node_id][0]:
+                    node_rank_map[node_id] = (rank, node)
+        hl_node_maps.append(node_rank_map)
+
+    num_stages = len(hl_node_maps)
+    hl_node_sets = [[] for _ in range(num_stages)]
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            hl_node_sets[stage_idx].append(node)
+    
+    # 2. 단계 간 경로 탐색 (완전 경로만)
+    G = knowledge_graph_inst._graph
+    all_full_paths = []
+
+    for s in hl_node_sets[0]:
+        for t in hl_node_sets[-1]:
+            try:
+                raw_paths = nx.shortest_simple_paths(G, source=s["entity_name"], target=t["entity_name"])
+                for path_node_names in itertools.islice(raw_paths, 4):  # top-4 경로만 선택
+                    if len(path_node_names) == num_stages:
+                        path_dicts = []
+                        for name in path_node_names:
+                            try:
+                                node = await knowledge_graph_inst.get_node(name)
+                                node["entity_name"] = name
+                                path_dicts.append(node)
+                            except Exception as e:
+                                print(f"[SKIP] failed to get node for name={name}: {e}")
+                                break
+                        else:
+                            all_full_paths.append(path_dicts)
+            except Exception as e:
+                continue
+    
+    # 3. 경로 점수 계산 (cosine similarity)
+    embedding_func = query_param.addon_params["embedding_func"]
+    query_vec_np = np.ravel(await embedding_func(query))  
+    query_vec = torch.tensor(query_vec_np, dtype=torch.float32, device="cuda")
+    query_vec = query_vec / torch.norm(query_vec)
+
+    rel_matrix_np = relationships_vdb.client_storage["matrix"]
+    rel_data = relationships_vdb.client_storage["data"]
+
+    rel_matrix = torch.tensor(rel_matrix_np, dtype=torch.float32, device="cuda")
+    rel_matrix = rel_matrix / torch.norm(rel_matrix, dim=1, keepdim=True) 
+
+    cos_sims = torch.matmul(rel_matrix, query_vec)
+    cos_sims_cpu = cos_sims.cpu().numpy()
+
+    top_edge_threshold = 0.2
+    high_sim_edge_indices = set(np.where(cos_sims_cpu > top_edge_threshold)[0])
+
+    edge_key_to_idx = {(d["src_id"], d["tgt_id"]): i for i, d in enumerate(rel_data)}
+
+    valid_paths = []
+    for path in all_full_paths:
+        edge_idxs = [
+            edge_key_to_idx.get((path[i]["entity_name"], path[i+1]["entity_name"]))
+            for i in range(len(path) - 1)
+        ]
+        edge_idxs = [idx for idx in edge_idxs if idx is not None and idx in high_sim_edge_indices]
+        if edge_idxs:
+            valid_paths.append((path, edge_idxs))
+
+    # 4. 최종 경로 선택 (top 30)
+    if query_param.mode == "final_wo_rerank":
+        random.shuffle(valid_paths)
+        top_paths = valid_paths[:30]
+    else:
+        top_paths = heapq.nlargest(30, valid_paths, key=lambda x: len(x[1]))
+
+    # 5. 최종 context 구성
+    reasoning_path_lines = []
+    all_nodes = OrderedDict()
+    all_edge_pairs = set()
+    all_chunk_ids = set()
+
+    for rank, (path, _) in enumerate(top_paths):
+        node_names = [node["entity_name"] for node in path]
+        reasoning_path_lines.append(f"[{rank + 1}] " + " → ".join(node_names))
+
+        for i in range(len(path)):
+            node = path[i]
+            node_name = node["entity_name"]
+            all_nodes[node_name] = node
+            if i < len(path) - 1:
+                src = path[i]["entity_name"]
+                tgt = path[i + 1]["entity_name"]
+                all_edge_pairs.add((src, tgt))
+
+    # 엔티티 정보 수집
+    entities_section_list = [["id", "entity", "type", "description"]]
+    for i, (entity_name, node) in enumerate(all_nodes.items()):
+        type_ = node.get("entity_type", "")
+        description = node.get("description", "")
+        entities_section_list.append([i, entity_name, type_, description])
+
+    # 엣지 정보 수집
+    relations_section_list = [["id", "source", "target", "description", "keywords"]]
+    for i, (src, tgt) in enumerate(all_edge_pairs):
+        edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+        if edge_data:
+            desc = edge_data.get("description", "")
+            keywords = edge_data.get("keywords", "")
+            relations_section_list.append([i, src, tgt, desc, keywords])
+
+    # CSV 생성
+    entities_context = list_of_list_to_csv(entities_section_list)
+    relations_context = list_of_list_to_csv(relations_section_list)
+
+    return reasoning_path_lines, entities_context, relations_context
+
+async def ours_path_search_full_path_only_chunk(
+    extended_queries,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # 1. 단계별 노드 집합 추출 (각 단계별 중복 제거 포함)
+    query = extended_queries[0]
+    ll_extended_queries = extended_queries[1]
+
+    hl_node_maps = []
+    all_candidate_entity_names = set()
+
+    for ll_queries in ll_extended_queries:
+        node_rank_map = {}
+        for ll in ll_queries:
+            top_nodes = await entities_vdb.query(ll, top_k=50)
+            for rank, node in enumerate(top_nodes):
+                node_id = node["id"]
+                entity_name = node["entity_name"]
+                all_candidate_entity_names.add(entity_name)
+                if node_id not in node_rank_map or rank < node_rank_map[node_id][0]:
+                    node_rank_map[node_id] = (rank, node)
+        hl_node_maps.append(node_rank_map)
+
+    num_stages = len(hl_node_maps)
+    hl_node_sets = [[] for _ in range(num_stages)]
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            hl_node_sets[stage_idx].append(node)
+    
+    # 2. 단계 간 경로 탐색 (완전 경로만)
+    G = knowledge_graph_inst._graph
+    all_full_paths = []
+
+    for s in hl_node_sets[0]:
+        for t in hl_node_sets[-1]:
+            try:
+                raw_paths = nx.shortest_simple_paths(G, source=s["entity_name"], target=t["entity_name"])
+                for path_node_names in itertools.islice(raw_paths, 4):  # top-4 경로만 선택
+                    if len(path_node_names) == num_stages:
+                        path_dicts = []
+                        for name in path_node_names:
+                            try:
+                                node = await knowledge_graph_inst.get_node(name)
+                                node["entity_name"] = name
+                                path_dicts.append(node)
+                            except Exception as e:
+                                print(f"[SKIP] failed to get node for name={name}: {e}")
+                                break
+                        else:
+                            all_full_paths.append(path_dicts)
+            except Exception as e:
+                continue
+    
+    # 3. 경로 점수 계산 (cosine similarity)
+    embedding_func = query_param.addon_params["embedding_func"]
+    query_vec_np = np.ravel(await embedding_func(query))  
+    query_vec = torch.tensor(query_vec_np, dtype=torch.float32, device="cuda")
+    query_vec = query_vec / torch.norm(query_vec)
+
+    rel_matrix_np = relationships_vdb.client_storage["matrix"]
+    rel_data = relationships_vdb.client_storage["data"]
+
+    rel_matrix = torch.tensor(rel_matrix_np, dtype=torch.float32, device="cuda")
+    rel_matrix = rel_matrix / torch.norm(rel_matrix, dim=1, keepdim=True) 
+
+    cos_sims = torch.matmul(rel_matrix, query_vec)
+    cos_sims_cpu = cos_sims.cpu().numpy()
+
+    top_edge_threshold = 0.2
+    high_sim_edge_indices = set(np.where(cos_sims_cpu > top_edge_threshold)[0])
+
+    edge_key_to_idx = {(d["src_id"], d["tgt_id"]): i for i, d in enumerate(rel_data)}
+
+    valid_paths = []
+    for path in all_full_paths:
+        edge_idxs = [
+            edge_key_to_idx.get((path[i]["entity_name"], path[i+1]["entity_name"]))
+            for i in range(len(path) - 1)
+        ]
+        edge_idxs = [idx for idx in edge_idxs if idx is not None and idx in high_sim_edge_indices]
+        if edge_idxs:
+            valid_paths.append((path, edge_idxs))
+
+    # 4. 최종 경로 선택 (top 30)
+    if query_param.mode == "final_wo_rerank":
+        random.shuffle(valid_paths)
+        top_paths = valid_paths[:30]
+    else:
+        top_paths = heapq.nlargest(30, valid_paths, key=lambda x: len(x[1]))
+
+    # 5. 최종 context 구성
+    reasoning_path_lines = []
+    all_nodes = OrderedDict()
+    all_edge_pairs = set()
+    all_chunk_ids = set()
+
+    for rank, (path, _) in enumerate(top_paths):
+        node_names = [node["entity_name"] for node in path]
+        reasoning_path_lines.append(f"[{rank + 1}] " + " → ".join(node_names))
+
+        for i in range(len(path)):
+            node = path[i]
+            node_name = node["entity_name"]
+            all_nodes[node_name] = node
+            if i < len(path) - 1:
+                src = path[i]["entity_name"]
+                tgt = path[i + 1]["entity_name"]
+                all_edge_pairs.add((src, tgt))
+
+                # 엣지의 출처 청크 ID 수집
+                edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+                if edge_data:
+                    source_id = edge_data.get("source_id", "")
+                    if source_id:
+                        all_chunk_ids.add(source_id)
+
+            # 노드의 출처 청크 ID 수집
+            chunk_id = node.get("source_id", "")
+            if chunk_id:
+                all_chunk_ids.add(chunk_id)
+
+    # 엔티티 정보 수집
+    entities_section_list = [["id", "entity", "type", "description"]]
+    for i, (entity_name, node) in enumerate(all_nodes.items()):
+        type_ = node.get("entity_type", "")
+        description = node.get("description", "")
+        entities_section_list.append([i, entity_name, type_, description])
+
+    # 엣지 정보 수집
+    relations_section_list = [["id", "source", "target", "description", "keywords"]]
+    for i, (src, tgt) in enumerate(all_edge_pairs):
+        edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+        if edge_data:
+            desc = edge_data.get("description", "")
+            keywords = edge_data.get("keywords", "")
+            relations_section_list.append([i, src, tgt, desc, keywords])
+
+    # 텍스트 정보 수집
+    text_units_section_list = [["id", "content"]]
+    for i, cid in enumerate(all_chunk_ids):
+        text_data = await text_chunks_db.get_by_id(cid)
+        if text_data:
+            content = text_data.get('content', "")
+            text_units_section_list.append([i, content])
+
+    # CSV 생성
+    entities_context = list_of_list_to_csv(entities_section_list)
+    relations_context = list_of_list_to_csv(relations_section_list)
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+
+    return reasoning_path_lines, entities_context, relations_context, text_units_context
+
+
+async def ours3_path_search(
+    extended_queries,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # 1. 단계별 노드 집합 추출 (각 단계별 중복 제거 포함)
+    query = extended_queries[0]
+    ll_extended_queries = extended_queries[1]
+
+    hl_node_maps = []
+    
+    all_candidate_entity_names = set()
+
+    total_ll_count = sum(len(ll_queries) for ll_queries in ll_extended_queries)
+    logger.info(f"Total number of ll queries: {total_ll_count}")
+    for ll_queries in ll_extended_queries:
+        node_rank_map = {}
+        for ll in ll_queries:
+            top_nodes = await entities_vdb.query(ll, top_k=40)
+            for rank, node in enumerate(top_nodes):
+                node_id = node["id"]
+                entity_name = node["entity_name"]
+                all_candidate_entity_names.add(entity_name)
+                
+                if node_id not in node_rank_map or rank < node_rank_map[node_id][0]:
+                    node_rank_map[node_id] = (rank, node)
+        hl_node_maps.append(node_rank_map)
+
+    node_stage_assignment = {}
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            if node_id not in node_stage_assignment or rank < node_stage_assignment[node_id][0]:
+                node_stage_assignment[node_id] = (rank, stage_idx)
+
+    num_stages = len(hl_node_maps)
+    hl_node_sets = [[] for _ in range(num_stages)]
+
+    for stage_idx, node_map in enumerate(hl_node_maps):
+        for node_id, (rank, node) in node_map.items():
+            assigned_stage = node_stage_assignment[node_id][1]
+            if assigned_stage == stage_idx:
+                hl_node_sets[stage_idx].append(node)
+    
+    # 2. 단계 간 경로 탐색
+    all_step_paths = []
+
+    G = knowledge_graph_inst._graph
+
+    for i in range(len(hl_node_sets) - 1):
+        source_nodes = hl_node_sets[i]
+        target_nodes = hl_node_sets[i + 1]
+
+        step_paths = []
+        start = time.time()
+        max_paths_per_pair = 5
+        for s in source_nodes:
+            for t in target_nodes:
+                try:
+                    raw_paths = nx.shortest_simple_paths(G, source=s["entity_name"], target=t["entity_name"])
+                    for path_node_names in itertools.islice(raw_paths, max_paths_per_pair):
+                        path_dicts = []
+                        for name in path_node_names:
+                            try:
+                                node = await knowledge_graph_inst.get_node(name)
+                                node["entity_name"] = name
+                                path_dicts.append(node)
+                            except Exception as e:
+                                print(f"[SKIP] failed to get node for name={name}: {e}")
+                                break
+                        else:
+                            step_paths.append(path_dicts)
+                except Exception as e:
+                    continue
+
+        all_step_paths.append(step_paths)
+        end = time.time()
+        print(f"실행 시간: {end - start:.5f} 초")
+        print(f"[INFO] Step {i+1}: {len(step_paths)} paths found between hl{i+1} → hl{i+2}")
+        start = time.time()
+        
+    merged_paths = [[path] for path in all_step_paths[0]]
+    
+    for step in range(1, len(all_step_paths)):
+        new_merged_paths = []
+        current_step_paths = all_step_paths[step]
+
+        used_paths = set()
+
+        start_node_to_paths = defaultdict(list)
+        
+        for path in current_step_paths:
+            start_node = path[0]["entity_name"]
+            start_node_to_paths[start_node].append(path)
+
+        # 병합 경로 확장
+        for merged in merged_paths:
+            last_path = merged[-1]
+            last_node = last_path[-1]
+            last_node_name = last_node["entity_name"]
+
+            if last_node_name in start_node_to_paths:
+                for next_path in start_node_to_paths[last_node_name]:
+                    new_merged_paths.append(merged + [next_path])
+            else:
+                new_merged_paths.append(merged)
+
+        for idx, path in enumerate(current_step_paths):
+            if idx not in used_paths:
+                new_merged_paths.append([path])
+
+        merged_paths = new_merged_paths
+    
+    full_length = len(all_step_paths)  
+    fully_connected_paths = [mp for mp in merged_paths if len(mp) == full_length]
+    
+    end = time.time()
+    print(f"실행 시간: {end - start:.5f} 초")
+    start = time.time()
+    
+    print(f"[INFO] Step 3: {len(fully_connected_paths)} paths hl1 -> hl2 -> hl3")
+    print(f"[INFO] All merged paths (including partial): {len(merged_paths)}")
+
+    # 3. 경로 점수 계산 및 경로 선택
+    embedding_func = query_param.addon_params["embedding_func"]
+    query_vec_np = np.ravel(await embedding_func(query))  # (D,)
+    query_vec = torch.tensor(query_vec_np, dtype=torch.float32, device="cuda")
+    query_vec = query_vec / torch.norm(query_vec)
+
+    # 2. 관계 벡터 임베딩 + Normalize
+    rel_matrix_np = relationships_vdb.client_storage["matrix"]  # shape (N, D)
+    rel_data = relationships_vdb.client_storage["data"]
+
+    rel_matrix = torch.tensor(rel_matrix_np, dtype=torch.float32, device="cuda")
+    rel_matrix = rel_matrix / torch.norm(rel_matrix, dim=1, keepdim=True)  # shape (N, D)
+
+    # 3. Cosine similarity 계산 (GPU)
+    cos_sims = torch.matmul(rel_matrix, query_vec)  # shape (N,)
+    cos_sims_cpu = cos_sims.cpu().numpy()
+
+    # 4. 유사도 기반 상위 edge filtering
+    top_edge_threshold = 0.2  # threshold 조절 가능
+    high_sim_edge_indices = set(np.where(cos_sims_cpu > top_edge_threshold)[0])
+
+    # 5. edge mapping: (src, tgt) → idx
+    edge_key_to_idx = {
+        (d["src_id"], d["tgt_id"]): i for i, d in enumerate(rel_data)
+    }
+
+    # 6. 경로 필터링 및 인덱싱
+    path_edge_indices = []
+    valid_path_refs = []
+
+    for multi_step_path in merged_paths:
+        edge_idxs = [
+            edge_key_to_idx.get((path[i]["entity_name"], path[i+1]["entity_name"]))
+            for path in multi_step_path
+            for i in range(len(path) - 1)
+        ]
+        edge_idxs = [idx for idx in edge_idxs if idx is not None and idx in high_sim_edge_indices]
+        
+        if edge_idxs:
+            path_edge_indices.append(edge_idxs)
+            valid_path_refs.append(multi_step_path)
+
+    print(f"[INFO] Filtered valid paths after top-edge filtering: {len(path_edge_indices)}")
+
+    # 7. NumPy 기반 패딩 + 마스크
+    if not path_edge_indices:
+        print("[WARN] No valid paths remain after filtering.")
+        top_paths = []
+    else:
+        max_len = max(len(idxs) for idxs in path_edge_indices)
+        num_paths = len(path_edge_indices)
+
+        padded_np = np.full((num_paths, max_len), -1, dtype=np.int64)
+        for i, idxs in enumerate(path_edge_indices):
+            padded_np[i, :len(idxs)] = idxs
+
+        padded_indices = torch.from_numpy(padded_np).to("cuda")
+        mask = (padded_indices != -1).float()
+
+        # 8. Cosine similarity 집계
+        path_sims = cos_sims[padded_indices]  # shape: (num_paths, max_len)
+        sum_sims = (path_sims * mask).sum(dim=1)
+        count_sims = mask.sum(dim=1)
+        avg_scores = sum_sims / count_sims  # (num_paths,)
+
+        # 9. heapq로 상위 30개 경로 추출
+        avg_scores_np = avg_scores.cpu().numpy()
+        top_paths = heapq.nlargest(50, zip(avg_scores_np, valid_path_refs), key=lambda x: x[0])
+
+    end = time.time()
+    print(f"실행 시간: {end - start:.2f} 초")
+    print(f"[INFO] Score calculation complete.")
+        
+    # 4. 정보 수집
+    used_edge_keys = set()
+    used_entity_names = set()
+    reasoning_context_lines = []
+
+    for rank, (_, multi_step_path) in enumerate(top_paths):
+        path_lines = [f"[Reasoning Path {rank + 1}]"]
+        for step in multi_step_path:
+            for node in step:
+                if isinstance(node, dict) and "entity_name" in node:
+                    used_entity_names.add(node["entity_name"])
+            for i in range(len(step) - 1):
+                src = step[i].get("entity_name")
+                tgt = step[i + 1].get("entity_name")
+                edge_key = (src, tgt)
+                used_edge_keys.add(edge_key)
+
+                try:
+                    edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+                    if isinstance(edge_data, dict):
+                        edge_desc = edge_data.get("description", "")
+                        path_lines.append(f"({src} → {tgt}) :: {edge_desc}")
+                except Exception as e:
+                    print(f"[ERROR] get_edge failed for {src}→{tgt}: {e}")
+                    continue
+        reasoning_context_lines.append("\n".join(path_lines))
+
+    # 누락된 노드 기반 엣지 정보 수집
+    rel_data = relationships_vdb.client_storage["data"]
+    missing_entity_names = all_candidate_entity_names - used_entity_names
+    missing_context_lines = []
+
+    rel_lookup = defaultdict(list)
+    for d in rel_data:
+        src, tgt = d["src_id"], d["tgt_id"]
+        rel_lookup[src].append((src, tgt))
+        rel_lookup[tgt].append((src, tgt))
+
+    seen_missing_edges = set()
+    missing_edge_count = 1
+    for name in missing_entity_names:
+        for (src, tgt) in rel_lookup[name]:
+            if (src, tgt) in used_edge_keys or (src, tgt) in seen_missing_edges:
+                continue
+            seen_missing_edges.add((src, tgt))
+
+            try:
+                edge_data = await knowledge_graph_inst.get_edge(src, tgt)
+                if isinstance(edge_data, dict):
+                    edge_desc = edge_data.get("description", "")
+                    missing_context_lines.append(
+                        f"[Additional Relevant Informations {missing_edge_count}]\n({src} → {tgt}) :: {edge_desc}"
+                    )
+                    missing_edge_count += 1
+            except Exception as e:
+                print(f"[ERROR] get_edge for missing entity {src}→{tgt}: {e}")
+                continue
+
+    # 최종 반환
+    return reasoning_context_lines, missing_context_lines
+
+async def ours_get_node_edge_data(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    # 1. step별로 관련 entities 추출 
+    if query_param.mode in ["ours9"]:
+        tasks = [entities_vdb.query(q, top_k=20) for q in query]
+            
+        results_list = await asyncio.gather(*tasks) 
+        
+        results = []
+        unique_ids = set()
+        node_map = {}
+        
+        count = 0  # 처리한 개수를 추적
+        step_count = 1  # 현재 step 번호
+        
+        for idx, results_per_query in enumerate(results_list):
+            for item in results_per_query:
+                entity_name = item["entity_name"]
+                
+                if entity_name not in unique_ids:
+                    unique_ids.add(entity_name)
+                    
+                    # 60개씩 step을 구분하여 step_type 설정
+                    step_type = f"step{step_count}"
+                    item["type"] = step_type
+                    node_map[entity_name] = item
+                    
+                count += 1  # 처리한 개수 증가
+                if count % 60 == 0:  # 60개가 처리될 때마다 step 증가
+                    step_count += 1
+        
+        results = list(node_map.values())
+        
+        if not len(results):
+            return "", "", ""
+    
+    # 결과를 step별로 저장할 defaultdict 생성
+    step_results = defaultdict(list)
+
+    # 데이터를 step별로 분리
+    for item in results:
+        step_type = item["type"]  # 예: "step1", "step2", "step3"
+        step_results[step_type].append(item)
+    
+    ranking_dict = {}  # 각 step entity의 다음 step entity들과의 관련 순위 정보 저장
+
+    step_names = sorted(step_results.keys(), key=lambda x: int(x.replace("step", "")))  # step1, step2, step3... 정렬
+
+    # Step별 관계 저장 (step1 -> step2, step2 -> step3, ...)
+    for i in range(len(step_names) - 1):
+        current_step = step_names[i]  # 현재 step (source)
+        next_step = step_names[i + 1]  # 다음 step (target)
+
+        current_step_entities = step_results[current_step]
+        next_step_entities = step_results[next_step]
+
+        # 다음 step의 entity들을 ID set으로 저장하여 filter_lambda 적용
+        next_step_entity_ids = {entity["__id__"] for entity in next_step_entities}
+
+        for current_entity in current_step_entities:
+            current_query = current_entity["entity_name"]  # 현재 step의 entity를 query로 사용
+
+            # filter_lambda를 적용하여 다음 step의 entity만 검색
+            filter_lambda = lambda data: data["__id__"] in next_step_entity_ids
+
+            # 현재 step의 entity를 이용해 다음 step의 entity 검색
+            results_entities = await entities_vdb.query(
+                current_query,
+                top_k=len(next_step_entities),
+                filter_lambda=filter_lambda
+            )
+
+            # 순위를 저장할 리스트 생성
+            rankings = []
+            for rank, entity in enumerate(results_entities, start=1):
+                rankings.append({
+                    "source": current_query,
+                    "target": entity["entity_name"],
+                    "rank": rank,  # 순위 저장
+                    "score": entity["distance"]  # 유사도 점수 저장
+                })
+
+            # Step별 순위 정보 저장
+            ranking_dict[current_query] = rankings
+
+    edges = []  # (source, target, rank) 정보를 저장하여 relationDB에서 사용
+    graph = nx.Graph()
+    
+        # Step 간 edge 추가 (순차적으로 진행)
+    for i in range(len(step_names) - 1):
+        current_step = step_names[i]
+        next_step = step_names[i + 1]
+
+        current_step_entities = {e["entity_name"] for e in step_results[current_step]}
+        next_step_entities = {e["entity_name"] for e in step_results[next_step]}
+
+        # 현재 step과 다음 step의 entity만 포함하는 subgraph 생성
+        graph = nx.Graph()
+        graph.add_nodes_from(current_step_entities)
+        graph.add_nodes_from(next_step_entities)
+
+        # Step 간 1순위 edge 먼저 추가
+        for source, rankings in ranking_dict.items():
+            if rankings and rankings[0]["target"] in next_step_entities:
+                first_rank_entity = rankings[0]  # 1순위 entity
+                edges.append((source, first_rank_entity["target"], first_rank_entity["rank"]))
+                graph.add_edge(source, first_rank_entity["target"])  # 그래프에 edge 추가
+
+        rank_level = 2  # 2순위부터 시작
+        # 1순위 edge 추가 후 step1 + step2 간 connected graph인지 확인
+        while not nx.is_connected(graph):  # 그래프가 완전히 연결될 때까지
+            for source, rankings in ranking_dict.items():
+                if rank_level - 1 < len(rankings):  # 해당 rank가 존재하는 경우
+                    next_rank_entity = rankings[rank_level - 1]  # 해당 rank의 entity
+                    if next_rank_entity["target"] in next_step_entities:  # 다음 step 내 entity만 추가
+                        edges.append((source, next_rank_entity["target"], next_rank_entity["rank"]))
+                        graph.add_edge(source, next_rank_entity["target"])  # 그래프에 edge 추가
+
+            rank_level += 1  # 다음 순위로 이동
+    
+    # edge 확장: 경로가 존재하면 경로상의 모든 edge 추가, 없으면 가상의 edge 추가
+    kg = await knowledge_graph_inst.get_knowledge_graph("*")
+    
+    # 그래프에 edge 추가
+    G = nx.Graph()
+    G.add_edges_from([(edge.source, edge.target) for edge in kg.edges])
+    
+    final_edges = []
+
+    for source, target, rank in edges:
+        try:
+            # knowledge graph에서 최단 경로 탐색
+            path = nx.shortest_path(G, source=source, target=target)
+
+            # path가 존재하면, 경로에 있는 모든 (u, v) edge 추가
+            for u, v in zip(path, path[1:]):
+                final_edges.append((u, v, rank, "connect"))  # 기존 rank 유지 또는 변경 가능
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            # 경로가 없으면 가상 edge 추가
+            final_edges.append((source, target, rank, "non-connect"))
+
+   
+    # get entity information
+    node_datas = await asyncio.gather(
+        *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
+    )
+    
+    edge_datas = await asyncio.gather(
+        *[knowledge_graph_inst.get_edge(e[0], e[1]) for e in final_edges]
+    )
+    
+    check_edge_datas = await asyncio.gather(
+        *[knowledge_graph_inst.get_edge(e[0], e[1]) for e in edges]
+    )
+
+    if not all([n is not None for n in node_datas]):
+        logger.warning("Some nodes are missing, maybe the storage is damaged")
+
+    
+    node_datas = [
+        {**n, "entity_name": k["entity_name"], "type": k["type"], "rank": d}
+        for k, n, d in zip(results, node_datas, node_degrees)
+        if n is not None
+    ] 
+    
+    # # GraphML 파일 업데이트
+    # if query_param.mode in ["ours", "ours1"]:
+    #     await save_to_node_graphml(query_param.mode, node_datas)
+    #     await save_to_node_edge_graphml(query_param.mode, use_relations)
+    # elif query_param.mode in ["ours2","ours3"]:
+    #     await save_to_node_graphml(query_param.mode, node_datas)
+    #     await save_to_node_edge_graphml(query_param.mode, use_relations)
+
+    # build prompt
+    entites_section_list = [["id", "entity", "type", "description", "rank"]]
+    for i, n in enumerate(node_datas):
+        entites_section_list.append(
+            [
+                i,
+                n["entity_name"],
+                n.get("entity_type", "UNKNOWN"),
+                n.get("description", "UNKNOWN"),
+                n["rank"],
+            ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+
+    relations_section_list = [
+        [
+            "id",
+            "source",
+            "target",
+            "description",
+            "keywords",
+            "weight",
+            "rank",
+            "created_at",
+        ]
+    ]
+    for i, e in enumerate(use_relations):
+        created_at = e.get("created_at", "UNKNOWN")
+        # Convert timestamp to readable format
+        if isinstance(created_at, (int, float)):
+            created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+        relations_section_list.append(
+            [
+                i,
+                e["src_tgt"][0],
+                e["src_tgt"][1],
+                e["description"],
+                e["keywords"],
+                e["weight"],
+                e["rank"],
+                created_at,
+            ]
+        )
+    relations_context = list_of_list_to_csv(relations_section_list)
+
+    text_units_section_list = [["id", "content"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"]])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+    return entities_context, relations_context, text_units_context
+
+async def get_text_embedding(text):
+    # Ensure input is a list (API supports batch requests)
+    if isinstance(text, str):
+        text = [text]  # Convert to a list
+        
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    
+    # Extract embeddings and convert to NumPy array
+    embeddings = np.array([res.embedding for res in response.data])
+    
+    return embeddings
+
+async def rerank_by_cosine_similarity(query, items, key="description"):
+    if not items:
+        return []
+    
+    descriptions = [item[key] for item in items]  # Extract descriptions
+
+    # Get embeddings
+    query_embedding = await get_text_embedding(query)  # Shape: (1, embedding_dim)
+    query_embedding = np.array(query_embedding).reshape(1, -1)
+    
+    item_embeddings = await get_text_embedding(descriptions)
+    item_embeddings = np.array(item_embeddings)
+    
+    # Compute cosine similarity
+    similarities = cosine_similarity(query_embedding, item_embeddings).flatten()
+
+    # Sort items based on similarity scores (descending order)
+    sorted_items = sorted(zip(similarities, items), key=lambda x: x[0], reverse=True)
+    
+    # Return only the sorted items
+    return [item for _, item in sorted_items]
+
+async def filter_node_query(knowledge_graph_inst: BaseGraphStorage, results, query, top_k):
+    node_datas = await asyncio.gather(
+        *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
+    )
+    
+    descriptions = [item["entity_name"]+info["description"] for item, info in zip(results, node_datas)]  # Extract descriptions
+
+    # Get embeddings
+    query_embedding = await get_text_embedding(query)  # Shape: (1, embedding_dim)
+    query_embedding = np.array(query_embedding).reshape(1, -1)
+    
+    item_embeddings = await get_text_embedding(descriptions)
+    item_embeddings = np.array(item_embeddings)
+    
+    # Compute cosine similarity
+    similarities = cosine_similarity(query_embedding, item_embeddings).flatten()
+
+    # Sort items based on similarity scores (descending order)
+    sorted_results = sorted(zip(similarities, results), key=lambda x: x[0], reverse=True)
+    
+    # Return only the top_k results
+    return [item for _, item in sorted_results[:top_k]]
+
+async def filter_edge_query(knowledge_graph_inst: BaseGraphStorage, results, query, top_k):
+    edge_datas = await asyncio.gather(
+        *[knowledge_graph_inst.get_edge(r["src_id"], r["tgt_id"]) for r in results]
+    )
+    
+    descriptions = [info["keywords"]+item["src_id"]+item["tgt_id"]+info["description"] for item, info in zip(results, edge_datas)]  # Extract descriptions
+
+    # Get embeddings
+    query_embedding = await get_text_embedding(query)  # Shape: (1, embedding_dim)
+    query_embedding = np.array(query_embedding).reshape(1, -1)
+    
+    item_embeddings = await get_text_embedding(descriptions)
+    item_embeddings = np.array(item_embeddings)
+    
+    # Compute cosine similarity
+    similarities = cosine_similarity(query_embedding, item_embeddings).flatten()
+
+    # Sort items based on similarity scores (descending order)
+    sorted_results = sorted(zip(similarities, results), key=lambda x: x[0], reverse=True)
+    
+    # Return only the top_k results
+    return [item for _, item in sorted_results[:top_k]]
+
+async def _find_most_related_text_unit_from_entities(
+    node_datas: list[dict],
+    query_param: QueryParam,
+    text_chunks_db: BaseKVStorage,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    text_units = [
+        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        for dp in node_datas
+    ]
+    edges = await asyncio.gather(
+        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
+    )
+    all_one_hop_nodes = set()
+    for this_edges in edges:
+        if not this_edges:
+            continue
+        all_one_hop_nodes.update([e[1] for e in this_edges])
+
+    all_one_hop_nodes = list(all_one_hop_nodes)
+    all_one_hop_nodes_data = await asyncio.gather(
+        *[knowledge_graph_inst.get_node(e) for e in all_one_hop_nodes]
+    )
+
+    # Add null check for node data
+    all_one_hop_text_units_lookup = {
+        k: set(split_string_by_multi_markers(v["source_id"], [GRAPH_FIELD_SEP]))
+        for k, v in zip(all_one_hop_nodes, all_one_hop_nodes_data)
+        if v is not None and "source_id" in v  # Add source_id check
+    }
+
+    all_text_units_lookup = {}
+    tasks = []
+    for index, (this_text_units, this_edges) in enumerate(zip(text_units, edges)):
+        for c_id in this_text_units:
+            if c_id not in all_text_units_lookup:
+                tasks.append((c_id, index, this_edges))
+
+    results = await asyncio.gather(
+        *[text_chunks_db.get_by_id(c_id) for c_id, _, _ in tasks]
+    )
+
+    for (c_id, index, this_edges), data in zip(tasks, results):
+        all_text_units_lookup[c_id] = {
+            "data": data,
+            "order": index,
+            "relation_counts": 0,
+        }
+
+        if this_edges:
+            for e in this_edges:
+                if (
+                    e[1] in all_one_hop_text_units_lookup
+                    and c_id in all_one_hop_text_units_lookup[e[1]]
+                ):
+                    all_text_units_lookup[c_id]["relation_counts"] += 1
+
+    # Filter out None values and ensure data has content
+    all_text_units = [
+        {"id": k, **v}
+        for k, v in all_text_units_lookup.items()
+        if v is not None and v.get("data") is not None and "content" in v["data"]
+    ]
+
+    if not all_text_units:
+        logger.warning("No valid text units found")
+        return []
+
+    all_text_units = sorted(
+        all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
+    )
+
+    all_text_units = truncate_list_by_token_size(
+        all_text_units,
+        key=lambda x: x["data"]["content"],
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+
+    all_text_units = [t["data"] for t in all_text_units]
+    return all_text_units
+
+
+async def _find_most_related_edges_from_entities(
+    node_datas: list[dict],
+    query_param: QueryParam,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    all_related_edges = await asyncio.gather(
+        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
+    )
+    all_edges = []
+    seen = set()
+
+    for this_edges in all_related_edges:
+        for e in this_edges:
+            sorted_edge = tuple(sorted(e))
+            if sorted_edge not in seen:
+                seen.add(sorted_edge)
+                all_edges.append(sorted_edge)
+
+    all_edges_pack, all_edges_degree = await asyncio.gather(
+        asyncio.gather(*[knowledge_graph_inst.get_edge(e[0], e[1]) for e in all_edges]),
+        asyncio.gather(
+            *[knowledge_graph_inst.edge_degree(e[0], e[1]) for e in all_edges]
+        ),
+    )
+    all_edges_data = [
+        {"src_tgt": k, "rank": d, **v}
+        for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
+        if v is not None
+    ]
+    all_edges_data = sorted(
+        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+    )
+    all_edges_data = truncate_list_by_token_size(
+        all_edges_data,
+        key=lambda x: x["description"],
+        max_token_size=query_param.max_token_for_global_context,
+    )
+    return all_edges_data
+
+
+async def _get_edge_data(
+    keywords,
+    knowledge_graph_inst: BaseGraphStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
+
+    if not len(results):
+        return "", "", ""
+
+    edge_datas, edge_degree = await asyncio.gather(
+        asyncio.gather(
+            *[knowledge_graph_inst.get_edge(r["src_id"], r["tgt_id"]) for r in results]
+        ),
+        asyncio.gather(
+            *[
+                knowledge_graph_inst.edge_degree(r["src_id"], r["tgt_id"])
+                for r in results
+            ]
+        ),
+    )
+
+    if not all([n is not None for n in edge_datas]):
+        logger.warning("Some edges are missing, maybe the storage is damaged")
+
+    edge_datas = [
+        {
+            "src_id": k["src_id"],
+            "tgt_id": k["tgt_id"],
+            "rank": d,
+            "created_at": k.get("__created_at__", None),  # 从 KV 存储中获取时间元数据
+            **v,
+        }
+        for k, v, d in zip(results, edge_datas, edge_degree)
+        if v is not None
+    ]
+    
+    edge_datas = sorted(
+        edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True
+    )
+    
+    edge_datas = truncate_list_by_token_size(
+        edge_datas,
+        key=lambda x: x["description"],
+        max_token_size=query_param.max_token_for_global_context,
+    )
+
+    use_entities, use_text_units = await asyncio.gather(
+        _find_most_related_entities_from_relationships(
+            edge_datas, query_param, knowledge_graph_inst
+        ),
+        _find_related_text_unit_from_relationships(
+            edge_datas, query_param, text_chunks_db, knowledge_graph_inst
+        ),
+    )
+    logger.info(
+        f"Global query uses {len(use_entities)} entites, {len(edge_datas)} relations, {len(use_text_units)} text units"
+    )
+    
+    # # GraphML 파일 업데이트
+    # await save_to_edge_graphml(query_param.mode, edge_datas)
+    # await save_to_edge_node_graphml(query_param.mode, use_entities)
+
+    relations_section_list = [
+        [
+            "id",
+            "source",
+            "target",
+            "description",
+            "keywords",
+            "weight",
+            "rank",
+            "created_at",
+        ]
+    ]
+    for i, e in enumerate(edge_datas):
+        created_at = e.get("created_at", "Unknown")
+        # Convert timestamp to readable format
+        if isinstance(created_at, (int, float)):
+            created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+        relations_section_list.append(
+            [
+                i,
+                e["src_id"],
+                e["tgt_id"],
+                e["description"],
+                e["keywords"],
+                e["weight"],
+                e["rank"],
+                created_at,
+            ]
+        )
+    relations_context = list_of_list_to_csv(relations_section_list)
+
+    entites_section_list = [["id", "entity", "type", "description", "rank"]]
+    for i, n in enumerate(use_entities):
+        entites_section_list.append(
+            [
+                i,
+                n["entity_name"],
+                n.get("entity_type", "UNKNOWN"),
+                n.get("description", "UNKNOWN"),
+                n["rank"],
+            ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+
+    text_units_section_list = [["id", "content"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"]])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+    return entities_context, relations_context, text_units_context
+
+async def ours_get_edge_data(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+):
+    if query_param.mode in ["ours", "ours1"]:
+        results = await relationships_vdb.query(query, top_k=query_param.top_k)
+
+        if not len(results):
+            return "", "", ""
+    elif query_param.mode in ["ours2", "ours3", "ours6", "ours7"]:
+        if query_param.mode == "ours2":
+            tasks = [relationships_vdb.query(q, top_k=20) for q in query]
+        elif query_param.mode in ["ours3", "ours6", "ours7"]:
+            tasks = [relationships_vdb.query(q, top_k=40) for q in query]
+            
+        results_list = await asyncio.gather(*tasks) 
+        
+        results = []
+        unique_edges = set()
+        edge_map = {}
+        
+        for idx, results_per_query in enumerate(results_list):
+            step_type = f"{query_param.mode}_step{idx+1}_edge"
+            for item in results_per_query:
+                src, tgt = item["src_id"], item["tgt_id"]
+                edge_key = (src, tgt) if src < tgt else (tgt, src)
+                
+                if edge_key not in unique_edges:
+                    unique_edges.add(edge_key)
+                    item["type"] = step_type
+                    edge_map[edge_key] = item
+                else:
+                    edge_map[edge_key]["type"] = f"{query_param.mode}_duplication_edge"
+        
+        results = list(edge_map.values())
+        
+        if not len(results):
+            return "", "", ""
+    elif query_param.mode in ["ours4"]:
+        type_queries = {}
+        type_queries["main_query"] = query[0][0]  # 메인 쿼리 저장
+
+        # Step-by-step query 저장
+        for i in range(len(query[1])):  # query[1]의 길이만큼 반복
+            step_key = f"step{i+1}_query"  
+            step_queries = [query[1][i]]  # step-by-step의 메인 질문 추가
+            
+            # 각 step-by-step에서 생성된 query 추가 (3개씩)
+            for j in range(3):
+                step_queries.append(query[2][3 * i + j])
+            
+            # 리스트를 하나의 문자열로 변환 (쉼표로 구분)
+            type_queries[step_key] = ", ".join(step_queries)
+
+        results = []
+        for i in range(0, len(query[1])+1):
+            if i == 0:
+                results = await relationships_vdb.query(type_queries["main_query"], top_k=60*(len(query[1])+1))
+            else:
+                results = await filter_edge_query(knowledge_graph_inst, results, type_queries[f"step{i}_query"], top_k=60*(len(query[1])+1-i))
+                print(f"step{i}_filter_edge_query, top_k: {60*(len(query[1])+1-i)}")
+    elif query_param.mode in ["ours8"]:
+        type_queries = {}
+        type_queries["main_query"] = query[0][0]  # 메인 쿼리 저장
+
+        # Step-by-step query 저장
+        for i in range(len(query[1])):  # query[1]의 길이만큼 반복
+            step_key = f"step{i+1}_query"  
+            step_queries = [query[1][i]]  # step-by-step의 메인 질문 추가
+            
+            # 각 step-by-step에서 생성된 query 추가 (3개씩)
+            for j in range(3):
+                step_queries.append(query[2][3 * i + j])
+            
+            # 리스트를 하나의 문자열로 변환 (쉼표로 구분)
+            type_queries[step_key] = ", ".join(step_queries)
+
+        results = []
+        for i in range(0, len(query[1])+1):
+            if i == 0:
+                results = await relationships_vdb.query(type_queries["main_query"], top_k=60*2**(len(query[1])))
+            else:
+                results = await filter_edge_query(knowledge_graph_inst, results, type_queries[f"step{i}_query"], top_k=60*2**(len(query[1])-i))
+                print(f"step{i}_filter_edge_query, top_k: {60*2**(len(query[1])-i)}")
+    elif query_param.mode in ["ours5"]:
+        type_queries = {}
+        type_queries["main_query"] = query[0][0]  # 메인 쿼리 저장
+
+        # Step-by-step query 저장
+        for i in range(len(query[1])):  # query[1]의 길이만큼 반복
+            step_key = f"step{i+1}_query"  
+            step_queries = [query[1][i]]  # step-by-step의 메인 질문 추가
+            
+            # 각 step-by-step에서 생성된 query 추가 (3개씩)
+            for j in range(3):
+                step_queries.append(query[2][3 * i + j])
+            
+            # 리스트를 하나의 문자열로 변환 (쉼표로 구분)
+            type_queries[step_key] = ", ".join(step_queries)
+
+        results = []
+        for i in range(0, len(query[1])):
+            if i == 0:
+                results = await relationships_vdb.query(type_queries["main_query"]+type_queries[f"step{i+1}_query"], top_k=60*(2**(len(query[1])-(i+1))))
+                print(f"step{i+1}_filter_edge_query, top_k: {60*(2**(len(query[1])-(i+1)))}")
+            else:
+                results = await filter_edge_query(knowledge_graph_inst, results, type_queries["main_query"]+type_queries[f"step{i+1}_query"], top_k=60*(2**(len(query[1])-(i+1))))
+                print(f"step{i+1}_filter_edge_query, top_k: {60*(2**(len(query[1])-(i+1)))}")
+
+    edge_datas, edge_degree = await asyncio.gather(
+        asyncio.gather(
+            *[knowledge_graph_inst.get_edge(r["src_id"], r["tgt_id"]) for r in results]
+        ),
+        asyncio.gather(
+            *[
+                knowledge_graph_inst.edge_degree(r["src_id"], r["tgt_id"])
+                for r in results
+            ]
+        ),
+    )
+
+    if not all([n is not None for n in edge_datas]):
+        logger.warning("Some edges are missing, maybe the storage is damaged")
+
+    if query_param.mode in ["ours", "ours1", "ours4", "ours5", "ours8"]:
+        edge_datas = [
+            {
+                "src_id": k["src_id"],
+                "tgt_id": k["tgt_id"],
+                "rank": d,
+                "created_at": k.get("__created_at__", None),  # 从 KV 存储中获取时间元数据
+                **v,
+            }
+            for k, v, d in zip(results, edge_datas, edge_degree)
+            if v is not None
+        ]
+    elif query_param.mode in ["ours2", "ours3", "ours6", "ours7"]:
+        edge_datas = [
+            {
+                "src_id": k["src_id"],
+                "tgt_id": k["tgt_id"],
+                "type":k["type"],
+                "rank": d,
+                "created_at": k.get("__created_at__", None),  # 从 KV 存储中获取时间元数据
+                **v,
+            }
+            for k, v, d in zip(results, edge_datas, edge_degree)
+            if v is not None
+        ]
+    
+    edge_datas = sorted(
+        edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True
+    )
+    edge_datas = truncate_list_by_token_size(
+        edge_datas,
+        key=lambda x: x["description"],
+        max_token_size=query_param.max_token_for_global_context,
+    )
+
+    use_entities, use_text_units = await asyncio.gather(
+        _find_most_related_entities_from_relationships(
+            edge_datas, query_param, knowledge_graph_inst
+        ),
+        _find_related_text_unit_from_relationships(
+            edge_datas, query_param, text_chunks_db, knowledge_graph_inst
+        ),
+    )
+    logger.info(
+        f"Global query uses {len(use_entities)} entities, {len(edge_datas)} relations, {len(use_text_units)} text units"
+    )
+    
+    # Rerank entities, relations, and text units using cosine similarity
+    if query_param.mode in ["ours", "ours1"]:
+        edge_datas = await rerank_by_cosine_similarity(query, edge_datas, key="description")
+        use_entities = await rerank_by_cosine_similarity(query, use_entities, key="description")
+        use_text_units = await rerank_by_cosine_similarity(query, use_text_units, key="content")
+    elif query_param.mode in ["ours2", "ours3"]:
+        pass
+    
+    # # GraphML 파일 업데이트
+    # if query_param.mode in ["ours", "ours1"]:
+    #     await save_to_edge_graphml(query_param.mode, edge_datas)
+    #     await save_to_edge_node_graphml(query_param.mode, use_entities)
+    # elif query_param.mode in ["ours2", "ours3"]:
+    #     await save_to_edge_graphml(query_param.mode, edge_datas)
+
+    relations_section_list = [
+        [
+            "id",
+            "source",
+            "target",
+            "description",
+            "keywords",
+            "weight",
+            "rank",
+            "created_at",
+        ]
+    ]
+    for i, e in enumerate(edge_datas):
+        created_at = e.get("created_at", "Unknown")
+        # Convert timestamp to readable format
+        if isinstance(created_at, (int, float)):
+            created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+        relations_section_list.append(
+            [
+                i,
+                e["src_id"],
+                e["tgt_id"],
+                e["description"],
+                e["keywords"],
+                e["weight"],
+                e["rank"],
+                created_at,
+            ]
+        )
+    relations_context = list_of_list_to_csv(relations_section_list)
+
+    entites_section_list = [["id", "entity", "type", "description", "rank"]]
+    for i, n in enumerate(use_entities):
+        entites_section_list.append(
+            [
+                i,
+                n["entity_name"],
+                n.get("entity_type", "UNKNOWN"),
+                n.get("description", "UNKNOWN"),
+                n["rank"],
+            ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+
+    text_units_section_list = [["id", "content"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"]])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+    return entities_context, relations_context, text_units_context
+
+
+async def _find_most_related_entities_from_relationships(
+    edge_datas: list[dict],
+    query_param: QueryParam,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    entity_names = []
+    seen = set()
+
+    for e in edge_datas:
+        if e["src_id"] not in seen:
+            entity_names.append(e["src_id"])
+            seen.add(e["src_id"])
+        if e["tgt_id"] not in seen:
+            entity_names.append(e["tgt_id"])
+            seen.add(e["tgt_id"])
+
+    node_datas, node_degrees = await asyncio.gather(
+        asyncio.gather(
+            *[
+                knowledge_graph_inst.get_node(entity_name)
+                for entity_name in entity_names
+            ]
+        ),
+        asyncio.gather(
+            *[
+                knowledge_graph_inst.node_degree(entity_name)
+                for entity_name in entity_names
+            ]
+        ),
+    )
+    node_datas = [
+        {**n, "entity_name": k, "rank": d}
+        for k, n, d in zip(entity_names, node_datas, node_degrees)
+    ]
+
+    node_datas = truncate_list_by_token_size(
+        node_datas,
+        key=lambda x: x["description"],
+        max_token_size=query_param.max_token_for_local_context,
+    )
+
+    return node_datas
+
+
+async def _find_related_text_unit_from_relationships(
+    edge_datas: list[dict],
+    query_param: QueryParam,
+    text_chunks_db: BaseKVStorage,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    text_units = [
+        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        for dp in edge_datas
+    ]
+    all_text_units_lookup = {}
+
+    async def fetch_chunk_data(c_id, index):
+        if c_id not in all_text_units_lookup:
+            chunk_data = await text_chunks_db.get_by_id(c_id)
+            # Only store valid data
+            if chunk_data is not None and "content" in chunk_data:
+                all_text_units_lookup[c_id] = {
+                    "data": chunk_data,
+                    "order": index,
+                }
+
+    tasks = []
+    for index, unit_list in enumerate(text_units):
+        for c_id in unit_list:
+            tasks.append(fetch_chunk_data(c_id, index))
+
+    await asyncio.gather(*tasks)
+
+    if not all_text_units_lookup:
+        logger.warning("No valid text chunks found")
+        return []
+
+    all_text_units = [{"id": k, **v} for k, v in all_text_units_lookup.items()]
+    all_text_units = sorted(all_text_units, key=lambda x: x["order"])
+
+    # Ensure all text chunks have content
+    valid_text_units = [
+        t for t in all_text_units if t["data"] is not None and "content" in t["data"]
+    ]
+
+    if not valid_text_units:
+        logger.warning("No valid text chunks after filtering")
+        return []
+
+    truncated_text_units = truncate_list_by_token_size(
+        valid_text_units,
+        key=lambda x: x["data"]["content"],
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+
+    all_text_units: list[TextChunkSchema] = [t["data"] for t in truncated_text_units]
+
+    return all_text_units
+
+
+def combine_contexts(entities, relationships, sources):
+    # Function to extract entities, relationships, and sources from context strings
+    hl_entities, ll_entities = entities[0], entities[1]
+    hl_relationships, ll_relationships = relationships[0], relationships[1]
+    hl_sources, ll_sources = sources[0], sources[1]
+    # Combine and deduplicate the entities
+    combined_entities = process_combine_contexts(hl_entities, ll_entities)
+
+    # Combine and deduplicate the relationships
+    combined_relationships = process_combine_contexts(
+        hl_relationships, ll_relationships
+    )
+
+    # Combine and deduplicate the sources
+    combined_sources = process_combine_contexts(hl_sources, ll_sources)
+
+    return combined_entities, combined_relationships, combined_sources
+
+def ours_combine_contexts(entities, relationships, sources):
+    # Function to extract entities, relationships, and sources from context strings
+    node_entities, edge_entities = entities[0], entities[1]
+    node_relationships, edge_relationships = relationships[0], relationships[1]
+    node_sources, edge_sources = sources[0], sources[1]
+    # Combine and deduplicate the entities
+    combined_entities = process_combine_contexts(node_entities, edge_entities)
+
+    # Combine and deduplicate the relationships
+    combined_relationships = process_combine_contexts(
+        node_relationships, edge_relationships
+    )
+
+    # Combine and deduplicate the sources
+    combined_sources = process_combine_contexts(node_sources, edge_sources)
+
+    return combined_entities, combined_relationships, combined_sources
+
+
+async def naive_query(
+    query,
+    chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+):
+    # Handle cache
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    results = await chunks_vdb.query(query, top_k=query_param.top_k)
+    if not len(results):
+        return PROMPTS["fail_response"]
+
+    chunks_ids = [r["id"] for r in results]
+    chunks = await text_chunks_db.get_by_ids(chunks_ids)
+
+    # Filter out invalid chunks
+    valid_chunks = [
+        chunk for chunk in chunks if chunk is not None and "content" in chunk
+    ]
+
+    if not valid_chunks:
+        logger.warning("No valid chunks found after filtering")
+        return PROMPTS["fail_response"]
+
+    maybe_trun_chunks = truncate_list_by_token_size(
+        valid_chunks,
+        key=lambda x: x["content"],
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+
+    if not maybe_trun_chunks:
+        logger.warning("No chunks left after truncation")
+        return PROMPTS["fail_response"]
+
+    logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
+    section = "\n--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
+
+    if query_param.only_need_context:
+        return section
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    sys_prompt_temp = PROMPTS["naive_rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        content_data=section,
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+    )
+
+    if len(response) > len(sys_prompt):
+        response = (
+            response[len(sys_prompt) :]
+            .replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # Save to cache
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+            cache_type="query",
+        ),
+    )
+
+    return response
+
+
+async def kg_query_with_keywords(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict,
+    hashing_kv: BaseKVStorage = None,
+) -> str:
+    """
+    Refactored kg_query that does NOT extract keywords by itself.
+    It expects hl_keywords and ll_keywords to be set in query_param, or defaults to empty.
+    Then it uses those to build context and produce a final LLM response.
+    """
+
+    # ---------------------------
+    # 1) Handle potential cache for query results
+    # ---------------------------
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    # ---------------------------
+    # 2) RETRIEVE KEYWORDS FROM query_param
+    # ---------------------------
+
+    # If these fields don't exist, default to empty lists/strings.
+    hl_keywords = getattr(query_param, "hl_keywords", []) or []
+    ll_keywords = getattr(query_param, "ll_keywords", []) or []
+
+    # If neither has any keywords, you could handle that logic here.
+    if not hl_keywords and not ll_keywords:
+        logger.warning(
+            "No keywords found in query_param. Could default to global mode or fail."
+        )
+        return PROMPTS["fail_response"]
+    if not ll_keywords and query_param.mode in ["local", "hybrid"]:
+        logger.warning("low_level_keywords is empty, switching to global mode.")
+        query_param.mode = "global"
+    if not hl_keywords and query_param.mode in ["global", "hybrid"]:
+        logger.warning("high_level_keywords is empty, switching to local mode.")
+        query_param.mode = "local"
+
+    # Flatten low-level and high-level keywords if needed
+    ll_keywords_flat = (
+        [item for sublist in ll_keywords for item in sublist]
+        if any(isinstance(i, list) for i in ll_keywords)
+        else ll_keywords
+    )
+    hl_keywords_flat = (
+        [item for sublist in hl_keywords for item in sublist]
+        if any(isinstance(i, list) for i in hl_keywords)
+        else hl_keywords
+    )
+
+    # Join the flattened lists
+    ll_keywords_str = ", ".join(ll_keywords_flat) if ll_keywords_flat else ""
+    hl_keywords_str = ", ".join(hl_keywords_flat) if hl_keywords_flat else ""
+
+    keywords = [ll_keywords_str, hl_keywords_str]
+
+    logger.info("Using %s mode for query processing", query_param.mode)
+
+    # ---------------------------
+    # 3) BUILD CONTEXT
+    # ---------------------------
+    context = await _build_query_context(
+        keywords,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+    )
+    if not context:
+        return PROMPTS["fail_response"]
+
+    # If only context is needed, return it
+    if query_param.only_need_context:
+        return context
+
+    # ---------------------------
+    # 4) BUILD THE SYSTEM PROMPT + CALL LLM
+    # ---------------------------
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    sys_prompt_temp = PROMPTS["rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        context_data=context,
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # Save to cache
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+            cache_type="query",
+        ),
+    )
+    return response

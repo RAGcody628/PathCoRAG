@@ -1,0 +1,17 @@
+[Unit]
+Description=PathCoRAG XYJ Ollama Service
+After=network.target
+
+[Service]
+Type=simple
+User=netman
+# Memory settings
+MemoryHigh=8G
+MemoryMax=12G
+WorkingDirectory=/home/netman/PathCoRAG-xyj
+ExecStart=/home/netman/PathCoRAG-xyj/PathCoRAG-api
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

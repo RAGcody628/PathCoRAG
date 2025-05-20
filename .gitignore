@@ -2,7 +2,7 @@ __pycache__
 *.egg-info
 dickens/
 book.txt
-lightrag-dev/
+PathCoRAG-dev/
 .idea/
 dist/
 env/

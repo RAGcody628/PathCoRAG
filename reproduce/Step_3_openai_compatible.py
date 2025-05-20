@@ -2,15 +2,15 @@ import os
 import re
 import json
 import asyncio
-from lightrag import LightRAG, QueryParam
+from PathCoRAG import PathCoRAG, QueryParam
 from tqdm import tqdm
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-from lightrag.utils import EmbeddingFunc
+from PathCoRAG.llm.openai import openai_complete_if_cache, openai_embed
+from PathCoRAG.utils import EmbeddingFunc
 import numpy as np
 
 
 ## For Upstage API
-# please check if embedding_dim=4096 in lightrag.py and llm.py in lightrag direcotry
+# please check if embedding_dim=4096 in PathCoRAG.py and llm.py in PathCoRAG direcotry
 async def llm_model_func(
     prompt, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
@@ -98,8 +98,8 @@ if __name__ == "__main__":
     mode = "hybrid"
     WORKING_DIR = f"../{cls}"
 
-    rag = LightRAG(working_dir=WORKING_DIR)
-    rag = LightRAG(
+    rag = PathCoRAG(working_dir=WORKING_DIR)
+    rag = PathCoRAG(
         working_dir=WORKING_DIR,
         llm_model_func=llm_model_func,
         embedding_func=EmbeddingFunc(
