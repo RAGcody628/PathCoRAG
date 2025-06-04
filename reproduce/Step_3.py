@@ -65,7 +65,7 @@ def run_queries_and_save_to_json(
 
 
 if __name__ == "__main__":
-    cls = "mix"
+    cls = "agriculture"
     mode = "final"
     WORKING_DIR = f"../{cls}"
 
