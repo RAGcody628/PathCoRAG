@@ -64,3 +64,32 @@ python eval.py
 ```bash
 python eval2.py
 ```
+
+## 📊 Evaluation
+We use GPT-based win-rate scoring to evaluate answers in terms of:
+
+Comprehensiveness
+
+Diversity
+
+Empowerment
+
+Overall Quality
+
+See eval.py and eval2.py for details.
+
+## 🗂️ Project Structure
+```bash
+PathCoRAG/
+├── PathCoRAG/             # Main package (KG, LLM, prompt, etc.)
+├── datasets/              # Input datasets and generated questions
+├── reproduce/             # Reproducibility scripts (Step_0~3)
+├── examples/              # Evaluation prompt builder
+├── eval.py                # Main evaluation execution
+├── eval2.py               # Visualization of evaluation results
+├── install.sh             # Installation helper script
+├── README.md
+```
+
+## 📝 License
+This project is licensed under the MIT License.
